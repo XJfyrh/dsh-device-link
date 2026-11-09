@@ -1,0 +1,8 @@
+- insert:
+    - id: device-link
+      name: dsh-device-link
+      config:
+        allowIncoming: true
+        listenPort: 47654
+        bindAddress: auto
+        deviceName: ''
