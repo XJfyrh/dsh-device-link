@@ -1,8 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { WorkspaceFact } from './types.js'
+import type { WorkspaceFact, ModelSelection, ModelCatalog } from './types.js'
 
-export interface HostMessage { role: string; content: unknown }
-export interface HostEvent { type: string; seq: number; data: Record<string, unknown> }
+export interface HostMessage { role: string; content: unknown; source?: Record<string, unknown> }
+export interface HostEvent { type: string; seq: number; time?: number; data: Record<string, unknown> }
 export interface HostSession {
   id: string
   header: { id?: string; cwd?: string; createdAt?: number | string }
@@ -17,6 +17,7 @@ export interface HostAgent {
   status: string
   session: HostSession
   options: { model?: string; provider?: string }
+  inbox?: { nextTurn: HostMessage[]; nextStep: HostMessage[] }
 }
 export interface ToolDefinition {
   name: string
@@ -25,7 +26,7 @@ export interface ToolDefinition {
   output: { schema: Record<string, unknown>; render(args: unknown, value: unknown): { type: 'text'; text: string }[] }
   timeoutMs?: number
   isConcurrencySafe(): boolean
-  execute(args: Record<string, unknown>): Promise<unknown>
+  execute(args: Record<string, unknown>, execution?: { callId: string; signal: AbortSignal; agent?: HostAgent }): Promise<unknown>
 }
 export interface HostServices {
   workspaceRegistry: { list(): WorkspaceFact[] }
@@ -35,10 +36,19 @@ export interface HostServices {
   permissionPresets: { set(session: HostSession, preset: string): void }
   sandboxPolicy: { resolve(request: { session: HostSession }): { mode: string; workspaceRoot: string } }
   sessionController: {
+    modelCatalog?(): Promise<ModelCatalog>
+    /** Harness 0.2.1 session-scoped admission; public selectModel also saves a device default. */
+    agents?: {
+      selectionFor(agent: HostAgent): { current: ModelSelection }
+      selectForNextRequest(agent: HostAgent, selection: ModelSelection): void
+      serializeImageAdmission<T>(agent: HostAgent, operation: () => Promise<T>): Promise<T>
+    }
     create(request: { sessionId: string; cwd: string }): Promise<{ sessionId: string }>
     prompt(request: { requestId: string; sessionId: string; mode: 'queue'; content: { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>
     cancel(request: { sessionId: string }): Promise<unknown>
+    resolveAgent?(sessionId: string): Promise<{ agent?: HostAgent; error?: { message?: string } }>
   }
+  llm: { resolveCallConfig(selection: ModelSelection): Promise<ModelSelection> }
   sessionQuery: {
     listSessions(): Promise<{ header: HostSession['header']; live: boolean }[]>
     readSession(id: string): Promise<{ session: HostSession['header']; events: HostEvent[] }>

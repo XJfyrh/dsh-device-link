@@ -4,29 +4,35 @@ import type { HostContext } from './host.js'
 import { readJson, sendJson } from './http.js'
 import { diagnose } from './network.js'
 import { defaultScope, normalizeScope } from './scope.js'
+import { parseSelection } from './models.js'
 import { HttpError, errorMessage, type AccountRelation } from './types.js'
 
 export async function statePayload(runtime: Runtime) {
   const { server, connector, store, hostFacts } = runtime
   const peers = await Promise.all(Object.values(store.state().peers).map(peer => connector.sync(peer)))
   return { ok: true as const, ...server.info(), identity: store.state().identity, pairing: server.pairingCode(),
-    addresses: server.addresses(), host: await hostFacts(), peers, trusted: server.trusted() }
+    addresses: server.addresses(), host: await hostFacts(), peers, trusted: server.trusted(), favorites: store.state().favorites }
 }
 export type DeviceState = Awaited<ReturnType<typeof statePayload>>
 
 export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntime }): () => void {
   async function handle(req: IncomingMessage, res: ServerResponse, runtime: Runtime): Promise<void> {
-    const { server, connector, store } = runtime
+    const { server, connector, store, outgoingTasks } = runtime
     const route = new URL(req.url ?? '/', 'http://localhost').pathname.slice('/device-link/api/'.length)
     if (req.method === 'GET' && route === 'state') { sendJson(res, 200, await statePayload(runtime)); return }
     if (req.method === 'GET' && route === 'references') {
       sendJson(res, 200, { ok: true, peers: Object.values(store.state().peers).map(peer => connector.cachedView(peer)) })
       return
     }
+    if (req.method === 'GET' && route === 'tasks') {
+      sendJson(res, 200, { ok: true, tasks: outgoingTasks.list() }); return
+    }
     if (req.method !== 'POST') throw new HttpError(404, 'unknown device-link endpoint')
     const body = await readJson(req)
     let result: unknown
     switch (route) {
+      case 'task-refresh': result = { task: await outgoingTasks.refresh(String(body.id ?? '')) }; break
+      case 'task-cancel': result = { task: await outgoingTasks.cancel(String(body.id ?? '')) }; break
       case 'allow': {
         const relationship = String(body.relationship ?? 'unknown') as AccountRelation
         result = server.openPairing({ relationship, scope: body.scope ? normalizeScope(body.scope) : defaultScope(relationship) })
@@ -56,8 +62,28 @@ export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntim
         const peer = connector.peerByRef(String(body.deviceId ?? ''))
         if (!peer) throw new HttpError(404, '没有这个设备')
         if (route === 'open') result = await connector.access(peer)
+        else if (route === 'execution') result = await connector.execution(peer, String(body.workspacePath ?? ''), typeof body.sessionId === 'string' ? body.sessionId : undefined)
+        else if (route === 'task-start') result = { task: await outgoingTasks.start(peer, {
+          id: String(body.id ?? ''), workspacePath: String(body.workspacePath ?? ''), task: String(body.task ?? ''),
+          sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined,
+          selection: parseSelection(body.selection),
+          originSessionId: typeof body.originSessionId === 'string' ? body.originSessionId : undefined,
+        }) }
+        else if (route === 'favorite') {
+          const path = String(body.path ?? '')
+          const workspace = peer.cache?.status.host.workspaces.find(item => item.path === path)
+          if (body.enabled !== false && !workspace) throw new HttpError(404, '工作区尚未同步或已移除授权')
+          await store.update(draft => {
+            if (draft.peers[peer.deviceId]?.token !== peer.token) throw new HttpError(404, '设备连接已变更')
+            draft.favorites = draft.favorites.filter(item => item.deviceId !== peer.deviceId || item.path !== path)
+            if (body.enabled !== false && workspace) draft.favorites.push({ deviceId: peer.deviceId, path, title: workspace.title })
+          })
+          result = { favorites: store.state().favorites }
+        }
         else if (route === 'sync') result = { peer: await connector.sync(peer, true) }
-        else if (route === 'session') result = connector.cachedSession(peer, String(body.sessionId ?? ''))
+        else if (route === 'session') result = body.refresh === true
+          ? await connector.fetchSession(peer, String(body.sessionId ?? ''))
+          : connector.cachedSession(peer, String(body.sessionId ?? ''))
         else if (route === 'delegate') result = await connector.delegate(peer, { workspacePath: String(body.workspacePath ?? ''), task: String(body.task ?? ''), timeoutMs: Number(body.timeoutMs) || 300_000 })
         else throw new HttpError(404, 'unknown device-link endpoint')
       }

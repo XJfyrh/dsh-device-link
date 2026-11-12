@@ -1,5 +1,6 @@
 import { normalizeBase, updateStatus } from './network.js'
-import { API_VERSION, HttpError, errorMessage, record, type Store, type Logger, type Peer, type RemoteStatus, type SessionContent, type CachedSession, type DelegateInput, type DelegateResult } from './types.js'
+import { API_VERSION, HttpError, errorMessage, record, type Store, type Logger, type Peer, type RemoteStatus, type SessionContent, type CachedSession, type DelegateInput, type DelegateResult, type DeviceTask, type ModelSelection, type ExecutionContext } from './types.js'
+import { readableTitle } from './presentation.js'
 
 export function createConnector({ store, fetchImpl = globalThis.fetch, log = console }: { store: Store; fetchImpl?: typeof fetch; log?: Logger }) {
   const pending = new Map<string, Promise<PeerView>>()
@@ -63,6 +64,10 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
       const status = await facts(peer)
       const sessions: Record<string, CachedSession> = Object.create(null) as Record<string, CachedSession>
       if (status.scope.sessionSync === 'content') {
+        const previous = store.state().peers[peer.deviceId]?.cache?.sessions ?? {}
+        for (const session of status.host.sessions) {
+          if (previous[session.id]?.cwd === session.cwd) sessions[session.id] = previous[session.id]
+        }
         for (const session of status.host.sessions.slice(0, 20)) {
           try {
             const content = await request<{ session: SessionContent }>(peer.baseUrl, `/dl/session?id=${encodeURIComponent(session.id)}`, { token: peer.token })
@@ -71,6 +76,7 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
             sessions[session.id] = { ...content.session, cachedAt: new Date().toISOString() }
           } catch (error) {
             if (error instanceof HttpError && (error.status === 401 || error.status === 403)) throw error
+            if (error instanceof HttpError && error.status === 404) delete sessions[session.id]
             const previous = store.state().peers[peer.deviceId]?.cache?.sessions[session.id]
             if (previous && previous.cwd === session.cwd && !(error instanceof HttpError && error.status === 404)) sessions[session.id] = previous
             log.warn?.(`session sync ${session.id}: ${errorMessage(error)}`)
@@ -123,7 +129,7 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     const cache = store.state().peers[peer.deviceId]?.cache
     const session = cache && Object.hasOwn(cache.sessions, id) ? cache.sessions[id] : undefined
     if (!cache || !session) throw new HttpError(404, '该会话尚未缓存，先连接设备同步会话内容')
-    return { session, cachedAt: session.cachedAt, deviceId: peer.deviceId, device: peer.name }
+    return { session: { ...session, title: readableTitle(session, session.messages) }, cachedAt: session.cachedAt, deviceId: peer.deviceId, device: peer.name }
   }
   async function delegate(peer: Peer, input: DelegateInput): Promise<DelegateResult> {
     const timeoutMs = Math.min(600_000, Math.max(1000, input.timeoutMs ?? 300_000))
@@ -131,6 +137,33 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     if (!['completed', 'timeout', 'error'].includes(result.status) || typeof result.sessionId !== 'string') throw new HttpError(502, 'invalid delegation result')
     views.delete(peer.deviceId)
     return result
+  }
+  async function fetchSession(peer: Peer, id: string) {
+    const view = await sync(peer, true)
+    if (!view.online) return cachedSession(peer, id)
+    const fact = view.status?.host.sessions.find(item => item.id === id)
+    if (!fact || view.status?.scope.sessionSync !== 'content') throw new HttpError(403, '该会话正文未获授权')
+    let payload: { session: SessionContent }
+    try {
+      payload = await request<{ session: SessionContent }>(peer.baseUrl, `/dl/session?id=${encodeURIComponent(id)}`, { token: peer.token })
+    } catch (error) {
+      if (error instanceof HttpError && [401, 403].includes(error.status)) {
+        await store.update(draft => { if (draft.peers[peer.deviceId]?.token === peer.token) delete draft.peers[peer.deviceId].cache })
+        views.delete(peer.deviceId)
+      }
+      throw error
+    }
+    const session = payload.session
+    if (session.id !== id || session.cwd !== fact.cwd || !Array.isArray(session.messages)
+      || !session.messages.every(item => ['user', 'assistant'].includes(item.role) && typeof item.text === 'string')) throw new HttpError(502, 'invalid session content')
+    await store.update(draft => {
+      const current = draft.peers[peer.deviceId]
+      if (current?.token !== peer.token || !current.cache?.status.host.sessions.some(item => item.id === id && item.cwd === session.cwd)
+        || current.cache.status.scope.sessionSync !== 'content') throw new HttpError(403, '会话授权已变更')
+      current.cache.sessions[id] = { ...session, cachedAt: new Date().toISOString() }
+    })
+    views.delete(peer.deviceId)
+    return cachedSession(peer, id)
   }
   async function access(peer: Peer) {
     const payload = await request<{ url: string; expiresAt: string }>(peer.baseUrl, '/dl/access', { token: peer.token, body: {} })
@@ -141,11 +174,36 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
   async function revoke(peer: Peer) {
     let remoteRevoked = true
     try { await request(peer.baseUrl, '/dl/pair/revoke', { token: peer.token, body: { deviceId: store.state().identity.deviceId } }) } catch { remoteRevoked = false }
-    await store.update(draft => { delete draft.peers[peer.deviceId] })
+    await store.update(draft => {
+      delete draft.peers[peer.deviceId]
+      draft.favorites = draft.favorites.filter(item => item.deviceId !== peer.deviceId)
+      for (const [id, task] of Object.entries(draft.outgoingTasks)) if (task.deviceId === peer.deviceId) delete draft.outgoingTasks[id]
+    })
     views.delete(peer.deviceId)
     return { remoteRevoked }
   }
-  return { claim, facts, sync, cachedView, peerByRef, cachedSession, delegate, access, revoke,
+  function validateTask(task: DeviceTask, id: string): DeviceTask {
+    if (!task || task.id !== id || typeof task.sessionId !== 'string' || typeof task.workspacePath !== 'string'
+      || typeof task.prompt !== 'string' || typeof task.text !== 'string' || typeof task.updatedAt !== 'string'
+      || !['queued', 'running', 'stopping', 'completed', 'error', 'stopped', 'interrupted'].includes(task.status)) throw new HttpError(502, 'invalid delegated task response')
+    return task
+  }
+  return { claim, facts, sync, cachedView, peerByRef, cachedSession, fetchSession, delegate, access, revoke,
+    async execution(peer: Peer, workspacePath: string, sessionId?: string) {
+      return request<ExecutionContext>(peer.baseUrl, '/dl/execution', { token: peer.token, body: { workspacePath, sessionId }, timeoutMs: 15_000 })
+    },
+    async startTask(peer: Peer, input: { requestId: string; workspacePath: string; task: string; sessionId?: string; selection?: ModelSelection }) {
+      const response = await request<{ task: DeviceTask }>(peer.baseUrl, '/dl/tasks', { token: peer.token, body: input, timeoutMs: 10_000 })
+      return validateTask(response.task, input.requestId)
+    },
+    async readTask(peer: Peer, id: string) {
+      const response = await request<{ task: DeviceTask }>(peer.baseUrl, `/dl/tasks/${encodeURIComponent(id)}`, { token: peer.token })
+      return validateTask(response.task, id)
+    },
+    async cancelTask(peer: Peer, id: string) {
+      const response = await request<{ task?: DeviceTask; cancelled: boolean }>(peer.baseUrl, `/dl/tasks/${encodeURIComponent(id)}/cancel`, { token: peer.token, body: {}, timeoutMs: 15_000 })
+      return { task: response.task ? validateTask(response.task, id) : undefined, cancelled: response.cancelled === true }
+    },
     async probe(peer: Peer) { const view = await sync(peer); return { ok: view.online, error: view.probeError } },
     async remoteSessions(peer: Peer) { return { sessions: (await facts(peer)).host.sessions } } }
 }
@@ -163,7 +221,9 @@ export interface PeerView {
   probeError: string | null
 }
 function viewOf(peer: Peer, online: boolean, error?: string): PeerView {
+  const status = peer.cache?.status
   return { deviceId: peer.deviceId, name: peer.name, baseUrl: peer.baseUrl, online, lastSeenAt: peer.lastSeenAt,
-    cachedAt: peer.cache?.syncedAt ?? null, cachedSessionIds: Object.keys(peer.cache?.sessions ?? {}), status: peer.cache?.status ?? null,
+    cachedAt: peer.cache?.syncedAt ?? null, cachedSessionIds: Object.keys(peer.cache?.sessions ?? {}), status: status ? { ...status, host: { ...status.host,
+      sessions: status.host.sessions.map(session => ({ ...session, title: readableTitle(session, peer.cache?.sessions[session.id]?.messages) })) } } : null,
     update: peer.cache ? updateStatus(peer.cache.status.device.version) : 'unknown', probeError: error ?? null }
 }

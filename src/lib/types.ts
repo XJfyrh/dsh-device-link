@@ -1,4 +1,4 @@
-export const APP_VERSION = '0.2.0'
+export const APP_VERSION = '0.4.2'
 export const API_VERSION = 'v2'
 
 export type WorkspaceScope = 'all' | string[]
@@ -22,8 +22,15 @@ export interface TrustedDevice extends Identity, PairingGrant {
 }
 export interface WorkspaceFact { id: string; path: string; title: string }
 export interface SessionFact { id: string; title: string; cwd: string; updatedAt: number; live: boolean }
-export interface AgentFact { id: string; cwd: string; status: string; model?: string; provider?: string }
-export interface SessionMessage { role: 'user' | 'assistant'; text: string }
+export interface AgentFact { id: string; title?: string; cwd: string; status: string; model?: string; provider?: string }
+export interface ModelSelection { provider: string; model: string; reasoningEffort?: string }
+export interface ModelCatalog {
+  default: ModelSelection
+  groups: { id: string; name: string; models: { id: string; name: string; reasoning?: { efforts: { id: string; name: string }[]; defaultEffort?: string } }[] }[]
+  failures: { id: string; name: string; message: string }[]
+}
+export interface ExecutionContext { catalog: ModelCatalog; selected: ModelSelection; busy: boolean }
+export interface SessionMessage { role: 'user' | 'assistant'; text: string; seq?: number; requestId?: string; turn?: number; timestamp?: number; selection?: ModelSelection }
 export interface SessionContent extends SessionFact { messages: SessionMessage[]; truncated: boolean }
 export interface CachedSession extends SessionContent { cachedAt: string }
 export interface HostFacts {
@@ -60,6 +67,52 @@ export interface State {
   serve: { port: number; bindAddress: string; allowIncoming: boolean; lastAddress: string }
   trusted: Record<string, TrustedDevice>
   peers: Record<string, Peer>
+  favorites: FavoriteWorkspace[]
+  incomingTasks: Record<string, StoredTask>
+  outgoingTasks: Record<string, OutgoingTask>
+  taskCancellations: Record<string, string>
+}
+export interface FavoriteWorkspace { deviceId: string; path: string; title: string }
+export type TaskStatus = 'queued' | 'running' | 'stopping' | 'completed' | 'error' | 'stopped' | 'interrupted'
+export interface DeviceTask {
+  id: string
+  sessionId: string
+  workspacePath: string
+  prompt: string
+  status: TaskStatus
+  createdAt: string
+  updatedAt: string
+  text: string
+  error?: string
+  provider?: string
+  model?: string
+  reasoningEffort?: string
+  selection?: ModelSelection
+  promptRequestId?: string
+}
+export interface StoredTask extends DeviceTask {
+  ownerDeviceId: string
+  tokenHash: string
+  baselineSeq?: number
+  resume: boolean
+  promptRequestId: string
+}
+export interface OutgoingTask {
+  id: string
+  deviceId: string
+  deviceName: string
+  workspacePath: string
+  prompt: string
+  createdAt: string
+  resumeSessionId?: string
+  originSessionId?: string
+  originCallId?: string
+  remote?: DeviceTask
+  checkedAt?: string
+  connectionError?: string
+  submission: 'pending' | 'accepted' | 'failed' | 'cancelled'
+  cancelRequested?: boolean
+  selection?: ModelSelection
 }
 export interface Store {
   path: string
@@ -79,12 +132,18 @@ export interface DelegateInput {
   timeoutMs?: number
   signal?: AbortSignal
   confineWorkspace?: boolean
+  sessionId?: string
+  resume?: boolean
+  requestId?: string
+  selection?: ModelSelection
+  onProgress?(progress: { sessionId: string; baselineSeq: number; text: string; provider?: string; model?: string; reasoningEffort?: string }): Promise<void>
 }
 export interface DelegateResult {
   status: 'completed' | 'timeout' | 'error'
   sessionId: string
   text: string
   error?: string
+  cancelled?: boolean
 }
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)

@@ -14,7 +14,7 @@ function newState(deviceName?: string): State {
     version: STORE_VERSION,
     identity: { deviceId: crypto.randomBytes(16).toString('hex'), name: deviceName || os.hostname(), createdAt: new Date().toISOString() },
     serve: { port: 47654, bindAddress: 'auto', allowIncoming: true, lastAddress: '' },
-    trusted: {}, peers: {},
+    trusted: {}, peers: {}, favorites: [], incomingTasks: {}, outgoingTasks: {}, taskCancellations: {},
   }
 }
 
@@ -28,7 +28,7 @@ export async function openStore({ home, log = console, deviceName }: { home?: st
     if (parsed.version !== STORE_VERSION || !parsed.identity?.deviceId || !parsed.serve || !parsed.trusted || !parsed.peers) {
       throw new Error('invalid v2 device store')
     }
-    state = parsed
+    state = { ...parsed, favorites: parsed.favorites ?? [], incomingTasks: parsed.incomingTasks ?? {}, outgoingTasks: parsed.outgoingTasks ?? {}, taskCancellations: parsed.taskCancellations ?? {} }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       await fs.rename(file, `${file}.corrupt-${Date.now()}`)

@@ -1,6 +1,6 @@
 {
   "name": "dsh-device-link",
-  "version": "0.2.0",
+  "version": "0.4.2",
   "private": true,
   "type": "module",
   "description": "TypeScript LAN device pairing, scoped collaboration and offline session references for DeepSeek Harness",

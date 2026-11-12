@@ -19,6 +19,17 @@ test('host facts contain device runtime and tolerate absent optional services', 
   assert.deepEqual(facts.sessions, [])
   assert.deepEqual(facts.agents, [])
 })
+test('workspace entities are projected to JSON-safe fields including getter-backed paths', async () => {
+  class WorkspaceEntity {
+    readonly id = 'workspace-entity'
+    readonly internalOwner = { workspace: this }
+    get path() { return root }
+    get title() { return 'Workspace entity' }
+  }
+  const facts = await collectHostFacts(context({ workspaceRegistry: { list: () => [new WorkspaceEntity()] } }))
+  const serialized = JSON.parse(JSON.stringify(facts))
+  assert.deepEqual(serialized.workspaces, [{ id: 'workspace-entity', path: root, title: 'Workspace entity' }])
+})
 test('facts merge live and historical sessions, apply workspace and session filters', async () => {
   const current = session('live')
   const ctx = context({
@@ -47,12 +58,23 @@ test('path checks normalize traversal and retain platform case rules', () => {
 })
 test('content sync returns bounded user/assistant text and refuses metadata grants', async () => {
   const current = session('live')
-  current.deriveMessages = () => [{ role: 'user', content: 'hello' }, { role: 'tool', content: 'secret output' }, { role: 'assistant', content: [{ type: 'reasoning', text: 'private' }, { type: 'text', text: 'x'.repeat(70000) }] }]
+  current.deriveMessages = () => [{ role: 'user', content: 'internal model context must stay out of transcript' }]
+  current.snapshotEvents = () => [
+    { type: 'user/message', seq: 0, data: { content: 'hello', source: { kind: 'user' } } },
+    { type: 'user/message', seq: 1, data: { content: 'internal runtime context', source: { kind: 'runtime-context' } } },
+    { type: 'tool/result', seq: 1, data: { content: 'secret output' } },
+    { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'reasoning', text: 'private' }, { type: 'text', text: 'x'.repeat(70000) }] } } },
+  ]
   const ctx = context({ sessions: { list: () => [current], get: () => current } })
   const content = await readSessionContent(ctx, 'live', defaultScope('same-account'))
   assert.equal(content.messages.map(item => item.text).join('').length, 64000)
   assert.equal(content.truncated, true)
   assert.equal(content.messages.some(item => item.text.includes('private')), false)
+  assert.equal(content.messages.some(item => item.text.includes('internal model context')), false)
+  const events = current.snapshotEvents()
+  events[3].data.message = { content: 'answer' }
+  current.snapshotEvents = () => events
+  assert.deepEqual((await readSessionContent(ctx, 'live', defaultScope('same-account'))).messages.map(({role,text}) => ({role,text})), [{ role: 'user', text: 'hello' }, { role: 'assistant', text: 'answer' }])
   await assert.rejects(() => readSessionContent(ctx, 'live', { ...defaultScope('same-account'), sessionSync: 'metadata' }), /disabled/)
 })
 test('archived content uses sessionQuery without resuming its agent', async () => {

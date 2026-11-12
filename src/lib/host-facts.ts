@@ -1,6 +1,8 @@
 import os from 'node:os'
 import { service, type HostContext, type HostEvent, type HostMessage } from './host.js'
 import { isPathAllowed, sessionAllowed } from './scope.js'
+import { readableTitle } from './presentation.js'
+import { parseSelection } from './models.js'
 import { type Scope, type HostFacts, type SessionContent, type SessionFact, type SessionMessage, record, HttpError } from './types.js'
 export { isPathAllowed } from './scope.js'
 
@@ -26,22 +28,30 @@ function timestamp(value: unknown): number {
 }
 
 export async function collectHostFacts(ctx: Pick<HostContext, 'get'>, { scope, startedAt = Date.now() }: { scope?: Scope; startedAt?: number } = {}): Promise<HostFacts> {
-  const workspaces = (service(ctx, 'workspaceRegistry')?.list() ?? []).filter(item => isPathAllowed(item.path, scope?.workspaces))
+  const workspaces = (service(ctx, 'workspaceRegistry')?.list() ?? [])
+    .filter(item => isPathAllowed(item.path, scope?.workspaces))
+    .map(item => ({ id: item.id, path: item.path, title: item.title }))
   const live = service(ctx, 'sessions')?.list() ?? []
   const sessions = new Map<string, SessionFact>()
   const query = service(ctx, 'sessionQuery')
   if (query && scope?.sessionSync !== 'none') {
     for (const entry of await query.listSessions()) {
       const header = entry.header
-      if (header.id) sessions.set(header.id, { id: header.id, title: header.id, cwd: header.cwd ?? '', updatedAt: timestamp(header.createdAt), live: entry.live })
+      if (!header.id || (scope && !sessionAllowed({ id: header.id, cwd: header.cwd ?? '' }, scope))) continue
+      if (live.some(session => session.id === header.id)) continue
+      try {
+        const snapshot = await query.readSession(header.id)
+        sessions.set(header.id, sessionFact(header.id, header.cwd ?? '', snapshot.events, entry.live, timestamp(header.createdAt)))
+      } catch { /* A deleted or unreadable archive does not hide other sessions. */ }
     }
   }
   for (const session of live) {
-    sessions.set(session.id, { id: session.id, title: session.title || session.id, cwd: session.header.cwd ?? '', updatedAt: timestamp(session.updatedAt ?? session.header.createdAt), live: true })
+    if (scope && !sessionAllowed({ id: session.id, cwd: session.header.cwd ?? '' }, scope)) continue
+    sessions.set(session.id, sessionFact(session.id, session.header.cwd ?? '', session.snapshotEvents(), true, timestamp(session.updatedAt ?? session.header.createdAt), session.title))
   }
   const agents = (service(ctx, 'agents')?.list() ?? [])
     .filter(agent => isPathAllowed(agent.session.header.cwd, scope?.workspaces) && (!scope || sessionAllowed({ id: agent.id, cwd: agent.session.header.cwd ?? '' }, scope)))
-    .map(agent => ({ id: agent.id, cwd: agent.session.header.cwd ?? '', status: agent.status, model: agent.options.model, provider: agent.options.provider }))
+    .map(agent => ({ id: agent.id, title: sessions.get(agent.id)?.title ?? '新会话', cwd: agent.session.header.cwd ?? '', status: agent.status, model: agent.options.model, provider: agent.options.provider }))
   return {
     platform: process.platform, arch: process.arch, hostname: os.hostname(), node: process.version, startedAt,
     workspaces, sessions: [...sessions.values()].filter(session => !scope || sessionAllowed(session, scope)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 200),
@@ -49,12 +59,28 @@ export async function collectHostFacts(ctx: Pick<HostContext, 'get'>, { scope, s
   }
 }
 
-function eventMessages(events: HostEvent[]): SessionMessage[] {
-  return events.flatMap<SessionMessage>(event => {
-    if (event.type === 'user/message') return [{ role: 'user' as const, text: contentText(event.data.content) }]
-    if (event.type === 'assistant/message') return [{ role: 'assistant' as const, text: contentText(record(event.data.message).content) }]
-    return []
-  })
+function sessionFact(id: string, cwd: string, events: HostEvent[], live: boolean, created: number, title = ''): SessionFact {
+  const named = [...events].reverse().find(event => event.type === 'session/title' && typeof event.data.title === 'string')
+  return { id, cwd, live, title: readableTitle({ id, title: named ? String(named.data.title) : title }, eventMessages(events)),
+    updatedAt: Math.max(created, ...events.filter(event => event.type === 'user/message' || event.type === 'assistant/message').map(event => event.time ?? 0)) }
+}
+export function eventMessages(events: HostEvent[]): SessionMessage[] {
+  let turn: number | undefined
+  let selection: SessionMessage['selection']
+  const requests = new Map<number, string>()
+  const messages: SessionMessage[] = []
+  for (const event of events) {
+    if (event.type === 'turn/start') turn = typeof event.data.turn === 'number' ? event.data.turn : undefined
+    if (event.type === 'request/header') selection = parseSelection(record(event.data.header).config)
+    const currentTurn = typeof event.data.turn === 'number' ? event.data.turn : turn
+    const source = record(event.data.source)
+    if (event.type === 'user/message' && source.kind === 'user') {
+      if (currentTurn !== undefined && typeof source.rpcId === 'string') requests.set(currentTurn, source.rpcId)
+      messages.push({ role: 'user', text: contentText(event.data.content), seq: event.seq, turn: currentTurn, timestamp: event.time })
+    }
+    if (event.type === 'assistant/message') messages.push({ role: 'assistant', text: contentText(record(event.data.message).content), seq: event.seq, turn: currentTurn, timestamp: event.time, selection })
+  }
+  return messages.map(message => ({ ...message, requestId: message.turn === undefined ? undefined : requests.get(message.turn) }))
 }
 
 export async function readSessionContent(ctx: Pick<HostContext, 'get'>, id: string, scope: Scope): Promise<SessionContent> {
@@ -66,8 +92,7 @@ export async function readSessionContent(ctx: Pick<HostContext, 'get'>, id: stri
   const live = service(ctx, 'sessions')?.get(id)
   if (live) {
     if (!sessionAllowed({ id, cwd: live.header.cwd ?? '' }, scope)) throw new HttpError(403, 'session scope changed', 'scope')
-    messages = live.deriveMessages().filter(message => message.role === 'user' || message.role === 'assistant')
-      .map(message => ({ role: message.role as SessionMessage['role'], text: contentText(message.content) }))
+    messages = eventMessages(live.snapshotEvents())
   } else {
     const query = service(ctx, 'sessionQuery')
     if (!query) throw new HttpError(503, 'session history service unavailable')
@@ -75,6 +100,7 @@ export async function readSessionContent(ctx: Pick<HostContext, 'get'>, id: stri
     if (!sessionAllowed({ id, cwd: snapshot.session.cwd ?? '' }, scope)) throw new HttpError(403, 'session scope changed', 'scope')
     messages = eventMessages(snapshot.events)
   }
+  messages = messages.filter(message => message.text.trim())
   // Bound each snapshot and retain the latest text without tool outputs or reasoning blocks.
   let remaining = 64_000
   const bounded: SessionMessage[] = []
@@ -82,7 +108,7 @@ export async function readSessionContent(ctx: Pick<HostContext, 'get'>, id: stri
     if (!remaining) break
     const text = message.text.slice(-remaining)
     remaining -= text.length
-    bounded.unshift({ role: message.role, text })
+    bounded.unshift({ ...message, text })
   }
   return { ...fact, messages: bounded, truncated: bounded.length < messages.length || messages.reduce((n, message) => n + message.text.length, 0) > 64_000 }
 }

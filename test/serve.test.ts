@@ -13,6 +13,7 @@ import path from 'node:path'
 import net from 'node:net'
 
 import { defaultScope } from '../src/lib/scope.ts'
+import { APP_VERSION } from '../src/lib/types.ts'
 import { openStore } from '../src/lib/store.ts'
 import {
   createPairing,
@@ -246,7 +247,7 @@ test('GET /dl/info answers without auth and reports identity', async () => {
     assert.equal(info.json.ok, true)
     assert.equal(info.json.api, 'v2')
     assert.equal(info.json.app, 'dsh-device-link')
-    assert.equal(info.json.version, '0.2.0')
+    assert.equal(info.json.version, APP_VERSION)
     assert.equal(info.json.deviceId, harness.store.state().identity.deviceId)
     assert.equal(info.json.name, harness.store.state().identity.name)
     assert.equal(info.json.pairingOpen, false)

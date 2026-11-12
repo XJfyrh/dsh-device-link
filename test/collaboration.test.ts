@@ -12,7 +12,9 @@ import { createConnector } from '../src/lib/connect.ts'
 import { normalizeBase, diagnose, updateStatus } from '../src/lib/network.ts'
 import { defaultScope, normalizeScope, authorizedWorkspace } from '../src/lib/scope.ts'
 import { collectHostFacts } from '../src/lib/host-facts.ts'
+import { createTaskManager } from '../src/lib/tasks.ts'
 import type { Scope, SessionContent } from '../src/lib/types.ts'
+import { APP_VERSION } from '../src/lib/types.ts'
 
 async function harness(t: TestContext) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'device-collaboration-'))
@@ -26,16 +28,19 @@ async function harness(t: TestContext) {
   facts.sessions = [session]
   facts.agents = [{ id: session.id, cwd: workspace, status: 'running' }]
   let delegates = 0
+  const taskManager = await createTaskManager({store,ctx:{get:()=>undefined},run:async input=>({status:'completed',sessionId:input.sessionId!,text:'done'})})
   const server = createDeviceLinkServer({ config: { port: 0, bindAddress: '127.0.0.1' }, store, pairing: createPairing(),
     proxy: { handle(_req, res) { res.end('GUI') }, handleUpgrade(_req, socket) { socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n') } },
     factsProvider: async () => facts,
     sessionProvider: async () => session,
+    taskManager,
+    executionProvider: async () => ({catalog:{default:{provider:'p',model:'m'},groups:[],failures:[]},selected:{provider:'p',model:'m'},busy:false}),
     delegateProvider: async () => { delegates++; return { status: 'completed', sessionId: 's1', text: 'done' } },
   })
   const listen = await server.start()
   const base = `http://127.0.0.1:${listen.port}`
   const connector = createConnector({ store: local, log: { warn() {} } })
-  t.after(async () => { await server.stop(); await fs.rm(home, { recursive: true, force: true }) })
+  t.after(async () => { await taskManager.dispose(); await server.stop(); await fs.rm(home, { recursive: true, force: true }) })
   async function pair(scope = defaultScope('same-account')) {
     const grant = server.openPairing({ relationship: 'same-account', scope })
     return connector.claim(base, grant.code)
@@ -50,6 +55,19 @@ test('addresses reject credentials, paths, alternate IP forms and public destina
   for (const address of ['http://user:pass@192.168.1.9', '192.168.1.9/path', '192.168.1.9?token=x', '192.168.1.9#fragment', '8.8.8.8', '0.0.0.0', '127.1', '2130706433', '0x7f000001', '127.0.0.1:0', '127.0.0.1:65536', 'file:///etc/passwd']) {
     assert.throws(() => normalizeBase(address), undefined, address)
   }
+})
+
+test('execution model context obeys delegation and session scope, including owned tasks without history sync',async t=>{
+  const h=await harness(t)
+  const scope={...defaultScope('different-account'),workspaces:[h.workspace],allowDelegate:true,sessionSync:'none' as const}
+  const peer=await h.pair(scope)
+  assert.equal((await h.connector.execution(peer,h.workspace)).selected.model,'m')
+  await assert.rejects(()=>h.connector.execution(peer,h.workspace,'s1'),/未授权继续/)
+  await assert.rejects(()=>h.connector.execution(peer,h.home),/scope|authorized|grant/)
+  const task=await h.connector.startTask(peer,{requestId:'owned',workspacePath:h.workspace,task:'hello'})
+  assert.equal((await h.connector.execution(peer,h.workspace,task.sessionId)).selected.model,'m')
+  await h.server.setScope(h.local.state().identity.deviceId,{...scope,allowDelegate:false})
+  await assert.rejects(()=>h.connector.execution(peer,h.workspace),/delegation disabled/)
 })
 test('unknown account relation starts with an empty grant and never enables full UI implicitly', () => {
   assert.deepEqual(defaultScope('unknown').workspaces, [])
@@ -175,7 +193,20 @@ test('diagnostics distinguish address, protocol, and ready states', async t => {
   const h = await harness(t)
   assert.equal((await diagnose('8.8.8.8')).stage, 'address')
   assert.equal((await diagnose(h.base)).stage, 'ready')
-  assert.equal(updateStatus('0.2.0'), 'current')
-  assert.equal(updateStatus('0.3.0'), 'remote-newer')
+  assert.equal(updateStatus(APP_VERSION), 'current')
+  assert.equal(updateStatus('0.5.0'), 'remote-newer')
   assert.equal(updateStatus('0.1.0'), 'remote-older')
+})
+
+test('on-demand transcript authorization failure clears an earlier cached snapshot', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  let reads = 0
+  const connector = createConnector({ store: h.local, fetchImpl: async (url, options) => {
+    if (String(url).includes('/dl/session?') && ++reads === 2) return Response.json({ ok: false, error: 'grant changed' }, { status: 403 })
+    return fetch(url, options)
+  } })
+  await assert.rejects(() => connector.fetchSession(peer, 's1'), /grant changed/)
+  assert.throws(() => connector.cachedSession(peer, 's1'), /尚未缓存/)
+  assert.equal(connector.cachedView(h.local.state().peers[peer.deviceId]).status, null)
 })

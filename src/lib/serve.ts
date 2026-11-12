@@ -6,6 +6,9 @@ import { createDeviceToken, verifyToken, type createPairing } from './pairing.js
 import { lanAddresses } from './config.js'
 import { readJson, sendJson } from './http.js'
 import { authorizedWorkspace, defaultScope, normalizeScope, sessionAllowed, isPathAllowed } from './scope.js'
+import type { createTaskManager } from './tasks.js'
+import { parseSelection } from './models.js'
+import type { ExecutionContext } from './types.js'
 import { API_VERSION, APP_VERSION, HttpError, errorMessage, type Store, type Scope, type Logger, type PairingGrant, type HostFacts, type SessionContent, type DelegateInput, type DelegateResult, type TrustedDevice } from './types.js'
 
 export interface GuiProxy {
@@ -21,10 +24,12 @@ interface ServerDependencies {
   factsProvider?: (scope: Scope) => Promise<HostFacts>
   sessionProvider?: (id: string, scope: Scope) => Promise<SessionContent>
   delegateProvider?: (input: DelegateInput) => Promise<DelegateResult>
+  taskManager?: Awaited<ReturnType<typeof createTaskManager>>
+  executionProvider?: (workspace: string, sessionId?: string) => Promise<ExecutionContext>
   log?: Logger
 }
 
-export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, delegateProvider, log = console }: ServerDependencies) {
+export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, delegateProvider, taskManager, executionProvider, log = console }: ServerDependencies) {
   let listen: { host: string; port: number } | null = null
   let activePairing: (PairingGrant & { code: string; expiresAt: string }) | null = null
   const accessCodes = new Map<string, { token: string; deviceId: string; expiresAt: number }>()
@@ -61,10 +66,11 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     ids.add(deviceId)
     authorizedSockets.set(socket, ids)
   }
-  function closeDevice(deviceId: string): void {
+  async function closeDevice(deviceId: string): Promise<void> {
     for (const [socket, ids] of authorizedSockets) if (ids.has(deviceId)) socket.destroy()
     for (const [code, access] of accessCodes) if (access.deviceId === deviceId) accessCodes.delete(code)
     for (const controller of tasks.get(deviceId) ?? []) controller.abort(new Error('device authorization changed'))
+    await taskManager?.cancelOwner(deviceId)
   }
   async function collect(entry: TrustedDevice): Promise<HostFacts> {
     if (!factsProvider) throw new HttpError(503, 'host facts unavailable')
@@ -100,7 +106,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     const { token, tokenHash } = createDeviceToken()
     const deviceId = body.deviceId
     const createdAt = new Date().toISOString()
-    closeDevice(deviceId)
+    await closeDevice(deviceId)
     await store.update(draft => {
       draft.trusted[deviceId] = { deviceId, name: typeof body.name === 'string' ? body.name.slice(0, 120) : deviceId,
         createdAt, lastSeenAt: createdAt, active: true, tokenHash, relationship: grant.relationship, scope: grant.scope }
@@ -188,6 +194,50 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       }
       return
     }
+    if ((route === '/dl/tasks' || route === '/dl/execution') && req.method === 'POST') {
+      if (!taskManager) throw new HttpError(503, 'task service unavailable')
+      if (!entry.scope.allowDelegate) throw new HttpError(403, 'delegation disabled', 'scope')
+      const body = await readJson(req)
+      if (typeof body.workspacePath !== 'string' || (route === '/dl/tasks' && typeof body.task !== 'string')) throw new HttpError(400, 'workspacePath and task required')
+      const workspacePath = await authorizedWorkspace(body.workspacePath, entry.scope)
+      await collect(entry)
+      const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined
+      if (sessionId) {
+        const owned = Object.values(store.state().incomingTasks).some(task => task.ownerDeviceId === entry.deviceId
+          && task.tokenHash === entry.tokenHash && task.sessionId === sessionId && task.workspacePath === workspacePath)
+        if (!owned) {
+          if (entry.scope.sessionSync !== 'content' || !sessionAllowed({ id: sessionId, cwd: workspacePath }, entry.scope)) throw new HttpError(403, '此会话未授权继续，请在执行设备开放该会话正文或新建任务', 'scope')
+          if (!sessionProvider) throw new HttpError(503, 'session service unavailable')
+          const session = await sessionProvider(sessionId, entry.scope)
+          if (session.cwd !== workspacePath) throw new HttpError(403, 'session workspace does not match')
+          await collect(entry)
+        }
+      }
+      if (route === '/dl/execution') {
+        if (!executionProvider) throw new HttpError(503, '执行设备未提供模型目录')
+        const context = await executionProvider(workspacePath, sessionId)
+        await collect(entry)
+        sendJson(res, 200, { ok: true, ...context })
+        return
+      }
+      const task = await taskManager.submit(entry, { id: String(body.requestId ?? ''), workspacePath, task: String(body.task), sessionId, selection: parseSelection(body.selection) })
+      sendJson(res, 200, { ok: true, task })
+      return
+    }
+    const taskRoute = /^\/dl\/tasks\/([a-zA-Z0-9_-]{1,128})(\/cancel)?$/.exec(route)
+    if (taskRoute) {
+      if (!taskManager) throw new HttpError(503, 'task service unavailable')
+      await collect(entry)
+      if (req.method === 'POST' && taskRoute[2]) {
+        await readJson(req)
+        const task = await taskManager.cancel(entry, taskRoute[1])
+        await collect(entry)
+        sendJson(res, 200, { ok: true, task, cancelled: !task || task.status === 'stopped' })
+      } else if (req.method === 'GET' && !taskRoute[2]) {
+        sendJson(res, 200, { ok: true, task: taskManager.get(entry, taskRoute[1]) })
+      } else throw new HttpError(404, 'unknown task endpoint')
+      return
+    }
     if (route.startsWith('/dl/')) throw new HttpError(404, 'unknown device endpoint')
     requireUi(entry)
     trackSocket(req.socket, entry.deviceId)
@@ -237,7 +287,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
   }
   async function stop(): Promise<void> {
     closePairing()
-    for (const id of tasks.keys()) closeDevice(id)
+    await Promise.all(Object.keys(store.state().trusted).map(id => closeDevice(id)))
     accessCodes.clear()
     for (const socket of sockets) socket.destroy()
     await new Promise<void>(resolve => server.close(() => resolve()))
@@ -260,7 +310,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
   async function revoke(deviceId: string): Promise<boolean> {
     if (!store.state().trusted[deviceId]) return false
     await store.update(draft => { delete draft.trusted[deviceId] })
-    closeDevice(deviceId)
+    await closeDevice(deviceId)
     return true
   }
   async function setScope(deviceId: string, value: unknown): Promise<Scope> {
@@ -269,14 +319,14 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       if (!draft.trusted[deviceId]) throw new HttpError(404, 'trusted device not found')
       draft.trusted[deviceId].scope = scope
     })
-    closeDevice(deviceId)
+    await closeDevice(deviceId)
     return scope
   }
   async function setIncoming(allowed: boolean): Promise<void> {
     await store.update(draft => { draft.serve.allowIncoming = allowed })
     if (!allowed) {
       closePairing()
-      for (const id of Object.keys(store.state().trusted)) closeDevice(id)
+      await Promise.all(Object.keys(store.state().trusted).map(id => closeDevice(id)))
     }
   }
   return { start, stop, info, openPairing, closePairing, pairingCode: () => pairing.isOpen() ? activePairing : null,

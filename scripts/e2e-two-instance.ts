@@ -3,18 +3,21 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 import http from 'node:http'
+import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
 import { defaultScope } from '../src/lib/scope.js'
 import type { DeviceState } from '../src/lib/api.js'
-import type { DelegateResult } from '../src/lib/types.js'
-import { chromium } from '@playwright/test'
+import type { DelegateResult, SessionContent, OutgoingTask, ExecutionContext } from '../src/lib/types.js'
+import { chromium, expect, type Page } from '@playwright/test'
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const cli = process.env.DSH_CLI ?? path.join(process.env.LOCALAPPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'device-link-e2e-'))
 const children: ChildProcess[] = []
+const modelConfigured = Boolean(process.env.DEEPSEEK_API_KEY?.trim() || process.env.E2E_MODEL_HOME)
+const report: { name: string; passed: boolean; durationMs: number; error?: string }[] = []
 let passed = 0
 let failed = 0
 interface Instance { name: string; base: string; cookie: string; home: string; child: ChildProcess; log(): string }
@@ -24,15 +27,77 @@ function stop(child: ChildProcess): void {
   if (process.platform === 'win32') spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' })
   else child.kill('SIGTERM')
 }
-async function start(name: string): Promise<Instance> {
+async function start(name: string, listenPort = 0): Promise<Instance> {
   const home = path.join(root, name)
   const profile = path.join(home, 'profiles', 'test')
   await fs.mkdir(path.join(profile, 'node_modules'), { recursive: true })
-  await fs.symlink(project, path.join(profile, 'node_modules', 'dsh-device-link'), process.platform === 'win32' ? 'junction' : 'dir')
+  const pluginLink = path.join(profile, 'node_modules', 'dsh-device-link')
+  try {
+    await fs.symlink(project, pluginLink, process.platform === 'win32' ? 'junction' : 'dir')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    assert.equal(await fs.realpath(pluginLink), await fs.realpath(project))
+  }
   await fs.writeFile(path.join(profile, 'package.json'), JSON.stringify({ name: `device-link-e2e-${name}`, private: true, dependencies: { 'dsh-device-link': `link:${project}` },
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-device-link'] } } }))
   await fs.writeFile(path.join(profile, 'cordis.yml'), '[]\n')
-  await fs.writeFile(path.join(profile, 'cordis.patch.yml'), `- id: device-link\n  name: dsh-device-link\n  config:\n    allowIncoming: true\n    listenPort: 0\n    bindAddress: 127.0.0.1\n    deviceName: harness-${name}\n`)
+  const fixturePackage = path.join(profile, 'node_modules', 'device-link-test-workspace')
+  const workspacePath = path.join(home, 'workspace')
+  await fs.mkdir(fixturePackage, { recursive: true })
+  await fs.mkdir(workspacePath, { recursive: true })
+  await fs.writeFile(path.join(fixturePackage, 'package.json'), JSON.stringify({ name: 'device-link-test-workspace', type: 'module', exports: { '.': './index.mjs', './client': './client.js' }, dsh: { client: { platform: 'web', immediately: true } } }))
+  await fs.writeFile(path.join(fixturePackage, 'index.mjs'), `export const inject = ['workspaceController']
+export function apply(ctx, config) {
+  void ctx.workspaceController.create({ path: config.path }).catch(error => console.error('Test workspace initialization failed', error))
+}
+`)
+  await fs.writeFile(path.join(fixturePackage, 'client.js'), `
+window.__ModuleLoader__.load({
+  id: 'device-link-test-workspace',
+  factory(require) {
+    const React = require('react')
+    return {
+      inject: ['slots'],
+      apply(ctx) {
+        for (const [index, label] of ['短剧', '代码审查', '笔记'].entries()) {
+          function FooterAction({ wide }) {
+            return React.createElement('button', {
+              'data-test-footer-action': label,
+              title: label,
+              style: {
+                display: 'inline-flex', alignItems: 'center', justifyContent: wide ? 'flex-start' : 'center',
+                flex: '0 0 auto', border: 0, background: 'transparent',
+                font: 'var(--dsw-font-s-14)', color: 'var(--dsw-alias-label-secondary)',
+                padding: '7px 8px', height: 36,
+              },
+            }, wide ? label : label.slice(0, 1))
+          }
+          ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+            name: 'sidebar.footer.action', id: 'fixture-' + index, order: index,
+          }, FooterAction))
+        }
+      },
+    }
+  },
+})
+`)
+  const documentsDirectory = JSON.stringify(path.join(home, 'documents'))
+  await fs.writeFile(path.join(profile, 'cordis.patch.yml'), `- id: device-link
+  name: dsh-device-link
+  config:
+    allowIncoming: true
+    listenPort: 0
+    bindAddress: 127.0.0.1
+    deviceName: harness-${name}
+- id: workspace-controller
+  config:
+    documentsDirectory: ${documentsDirectory}
+- insert:
+    - id: test-workspace
+      name: device-link-test-workspace
+      config:
+        path: ${JSON.stringify(workspacePath)}
+`)
   // Optional model credentials and settings are supplied by an explicit isolated template home.
   if (process.env.E2E_MODEL_HOME) {
     for (const file of ['.credentials.yaml', 'settings.json']) {
@@ -42,7 +107,7 @@ async function start(name: string): Promise<Instance> {
     }
   }
   const child = spawn(process.execPath, [cli, '--profile', 'test', '--port', '0', '--no-open'], {
-    cwd: project, env: { ...process.env, DSH_HOME: home, DSH_DEVICE_LINK_PORT: '0', DSH_DEVICE_LINK_BIND: '127.0.0.1' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: project, env: { ...process.env, DSH_HOME: home, DSH_DEVICE_LINK_PORT: String(listenPort), DSH_DEVICE_LINK_BIND: '127.0.0.1' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   })
   children.push(child)
   let output = ''
@@ -59,7 +124,14 @@ async function start(name: string): Promise<Instance> {
   const response = await fetch(url, { redirect: 'manual' })
   const cookie = response.headers.getSetCookie()[0]?.split(';')[0]
   assert.ok(cookie, 'owner cookie exchange')
-  return { name, base: new URL(url).origin, cookie, home, child, log: () => output.replace(/token=[^\s]+/g, 'token=[redacted]') }
+  const instance = { name, base: new URL(url).origin, cookie, home, child, log: () => output.replace(/token=[^\s]+/g, 'token=[redacted]') }
+  const readyDeadline = Date.now() + 15_000
+  while (Date.now() < readyDeadline) {
+    const state = await api<DeviceState>(instance, 'state')
+    if (state.host.workspaces.some(workspace => workspace.path === workspacePath)) return instance
+    await delay(100)
+  }
+  throw new Error(`test workspace did not initialize\n${instance.log()}`)
 }
 async function api<T = Record<string, unknown>>(instance: Instance, route: string, body?: unknown): Promise<T> {
   const response = await fetch(`${instance.base}/device-link/api/${route}`, { method: body === undefined ? 'GET' : 'POST',
@@ -71,7 +143,45 @@ async function api<T = Record<string, unknown>>(instance: Instance, route: strin
   return payload
 }
 async function step(name: string, operation: () => Promise<void>): Promise<void> {
-  try { await operation(); passed++; console.log(`PASS ${name}`) } catch (error) { failed++; console.error(`FAIL ${name}`, error) }
+  const started = Date.now()
+  try {
+    await operation()
+    passed++
+    report.push({ name, passed: true, durationMs: Date.now() - started })
+    console.log(`PASS ${name}`)
+  } catch (error) {
+    failed++
+    report.push({ name, passed: false, durationMs: Date.now() - started, error: error instanceof Error ? error.message : String(error) })
+    console.error(`FAIL ${name}`, error)
+  }
+}
+async function capture(page: Page, name: string): Promise<void> {
+  const directory = path.join(project, '.e2e')
+  await fs.mkdir(directory, { recursive: true })
+  await fs.writeFile(path.join(directory, `${name}.txt`), await page.locator('body').ariaSnapshot())
+  await page.screenshot({ path: path.join(directory, `${name}.png`), fullPage: true })
+}
+async function assertFooterLayout(page: Page): Promise<void> {
+  await expect(page.locator('[data-test-footer-action]')).toHaveCount(3)
+  await expect.poll(() => page.locator('.dl-footer').evaluate(element => {
+    const container = element.closest('[data-slot="sidebar.footer.action"]')!.parentElement!
+    const bounds = container.getBoundingClientRect()
+    const entries = [...container.querySelectorAll<HTMLElement>('[data-test-footer-action], .dl-footer')].map(item => item.getBoundingClientRect())
+    return bounds.left >= 0 && entries.every(rect => rect.left >= bounds.left - 1 && rect.right <= bounds.right + 1)
+      && entries.every((rect, index) => index === 0 || rect.top >= entries[index - 1].bottom)
+      && entries.every((rect, index) => entries.slice(index + 1).every(other => rect.right <= other.left || other.right <= rect.left || rect.bottom <= other.top || other.bottom <= rect.top))
+  })).toBe(true)
+}
+async function assertNativeTypography(page: Page): Promise<void> {
+  const fonts = await page.evaluate(() => {
+    const native = getComputedStyle(document.querySelector('nav button')!)
+    const panel = getComputedStyle(document.querySelector('.dl-popover')!)
+    const heading = getComputedStyle(document.querySelector('.dl-popover h2')!)
+    return { native: { family: native.fontFamily, size: native.fontSize, line: native.lineHeight },
+      panel: { family: panel.fontFamily, size: panel.fontSize, line: panel.lineHeight }, weight: heading.fontWeight }
+  })
+  assert.deepEqual(fonts.panel, fonts.native)
+  assert.equal(fonts.weight, '500')
 }
 function websocket(url: string, cookie: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -85,7 +195,7 @@ function websocket(url: string, cookie: string): Promise<void> {
 }
 
 try {
-  const a = await start('a')
+  let a = await start('a')
   const b = await start('b')
   const sa = await api<DeviceState>(a, 'state')
   const sb = await api<DeviceState>(b, 'state')
@@ -93,6 +203,11 @@ try {
   const lanA = `http://${sa.listen.host}:${sa.listen.port}`
   let peerId = ''
   let cookie = ''
+  let fileSessionId = ''
+  const executionWorkspace = path.join(root, 'remote-workspace')
+  const marker = `DEVICE_FILE_${crypto.randomUUID()}`
+  await fs.mkdir(executionWorkspace)
+  await fs.writeFile(path.join(executionWorkspace, 'input.txt'), marker)
   await step('two isolated Harness hosts expose typed device state', async () => {
     assert.equal(sa.identity.name, 'harness-a')
     assert.equal(sb.identity.name, 'harness-b')
@@ -125,7 +240,7 @@ try {
   await step('UI creation path admits delegation and exposes the remote session', async () => {
     const result = await api<DelegateResult>(b, 'delegate', { deviceId: peerId, workspacePath: project, task: 'Reply with DEVICE_LINK_OK. Do not use tools.', timeoutMs: 30_000 })
     assert.ok(result.sessionId.startsWith('delegate-'))
-    if (process.env.DEEPSEEK_API_KEY?.trim() || process.env.E2E_MODEL_HOME) {
+    if (modelConfigured) {
       assert.equal(result.status, 'completed', result.error)
       assert.match(result.text, /DEVICE_LINK_OK/)
     } else {
@@ -135,23 +250,265 @@ try {
     const remote = await api<DeviceState>(a, 'state')
     assert.ok(remote.host.sessions.some(session => session.id === result.sessionId))
   })
+  if (modelConfigured) {
+    await step('scoped remote model reads a fixture and writes a file in its execution workspace', async () => {
+      await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: { ...defaultScope('different-account'), workspaces: [executionWorkspace], allowDelegate: true, sessionSync: 'content' } })
+      const result = await api<DelegateResult>(b, 'delegate', {
+        deviceId: peerId,
+        workspacePath: executionWorkspace,
+        task: '使用文件工具读取当前工作区的 input.txt，将其文本原样写入 result.txt。最后回复读取到的文本。',
+        timeoutMs: 120_000,
+      })
+      assert.equal(result.status, 'completed', result.error)
+      assert.equal((await fs.readFile(path.join(executionWorkspace, 'result.txt'), 'utf8')).trim(), marker)
+      assert.ok(result.text.includes(marker), 'remote reply must include text read from the fixture')
+      fileSessionId = result.sessionId
+    })
+    await step('remote grants reject a task outside the permitted workspace', async () => {
+      await assert.rejects(() => api(b, 'delegate', { deviceId: peerId, workspacePath: project, task: 'Reply blocked' }), /403/)
+    })
+    await step('remote transcript is synced and available through the local session endpoint', async () => {
+      assert.ok(fileSessionId)
+      await api(b, 'sync', { deviceId: peerId })
+      const cached = await api<{ session: SessionContent; cachedAt: string }>(b, 'session', { deviceId: peerId, sessionId: fileSessionId })
+      assert.ok(cached.session.messages.some(message => message.role === 'assistant' && message.text.includes(marker)))
+      assert.ok(cached.session.messages.every(message => !message.text.includes('Current runtime context.') && !message.text.includes('<system-reminder>')))
+      assert.ok(Date.parse(cached.cachedAt))
+    })
+    await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: defaultScope('same-account') })
+    await api(b, 'sync', { deviceId: peerId })
+  }
+  if (modelConfigured) await step('persistent tasks survive polling retries and continue the same remote session', async () => {
+    const id = crypto.randomUUID()
+    const input = { id, deviceId: peerId, workspacePath: executionWorkspace, task: '只回复 PERSISTENT_TASK_OK。' }
+    const first = await api<{ task: OutgoingTask }>(b, 'task-start', input)
+    const second = await api<{ task: OutgoingTask }>(b, 'task-start', input)
+    assert.equal(first.task.id, second.task.id)
+    let finished: OutgoingTask
+    await expect.poll(async () => {
+      finished = (await api<{ task: OutgoingTask }>(b, 'task-refresh', { id })).task
+      return finished.remote?.status
+    }, { timeout: 120_000, intervals: [800] }).toBe('completed')
+    assert.ok(finished!.remote!.text.includes('PERSISTENT_TASK_OK'))
+    const nextId = crypto.randomUUID()
+    await api(b, 'task-start', { ...input, id: nextId, sessionId: finished!.remote!.sessionId, task: '只回复 CONTINUED_TASK_OK。' })
+    let continued: OutgoingTask
+    await expect.poll(async () => {
+      continued = (await api<{ task: OutgoingTask }>(b, 'task-refresh', { id: nextId })).task
+      return continued.remote?.status
+    }, { timeout: 120_000, intervals: [800] }).toBe('completed')
+    assert.equal(continued!.remote!.sessionId, finished!.remote!.sessionId)
+    assert.ok(continued!.remote!.text.includes('CONTINUED_TASK_OK'))
+    const stoppedId = crypto.randomUUID()
+    await api(b, 'task-start', { ...input, id: stoppedId, task: '请仔细推理并写出一千字的排序算法比较。' })
+    const stopped = await api<{ task: OutgoingTask }>(b, 'task-cancel', { id: stoppedId })
+    assert.equal(stopped.task.remote?.status, 'stopped')
+    const saved = await api<{ tasks: OutgoingTask[] }>(b, 'tasks')
+    assert.equal(saved.tasks.find(task => task.id === id)?.remote?.status, 'completed')
+  })
   if (process.env.E2E_BROWSER === '1') {
-    await step('browser loads the Harness shell without JavaScript exceptions', async () => {
+    await step('device panel, favorites, reference chips, task cards, settings and offline preview', async () => {
       const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH })
+      let page: Page | undefined
+      const errors: string[] = []
       try {
-        const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-        const [name, ...parts] = b.cookie.split('=')
-        await context.addCookies([{ name, value: parts.join('='), url: b.base }])
-        const page = await context.newPage()
-        page.setDefaultTimeout(10_000)
-        const errors: string[] = []
-        page.on('pageerror', error => errors.push(error.message))
-        await page.goto(b.base)
-        await page.getByText('预览版说明', { exact: true }).waitFor()
-        await fs.mkdir(path.join(project, '.e2e'), { recursive: true })
-        await page.screenshot({ path: path.join(project, '.e2e', 'harness-shell.png'), fullPage: true })
+        async function open(instance: Instance) {
+          const context = await browser.newContext({ viewport: { width: 1440, height: 960 } })
+          const [name, ...parts] = instance.cookie.split('=')
+          await context.addCookies([{ name, value: parts.join('='), url: instance.base }])
+          const result = await context.newPage()
+          result.setDefaultTimeout(15_000)
+          result.on('pageerror', error => errors.push(error.message))
+          await result.goto(instance.base)
+          await result.getByRole('button', { name: '继续', exact: true }).click({ timeout: 3000 }).catch(() => {})
+          await result.getByRole('button', { name: '设备', exact: true }).waitFor()
+          return result
+        }
+        page = await open(b)
+        await assertFooterLayout(page)
+        await page.getByRole('button', { name: '设备', exact: true }).click()
+        await assertNativeTypography(page)
+        await capture(page, 'device-panel')
+        await page.getByRole('button', { name: '＋ 连接设备', exact: true }).click()
+        await page.getByLabel('设备地址', { exact: true }).fill(lanA)
+        await page.getByRole('button', { name: '诊断连接', exact: true }).click()
+        await expect(page.getByText('连接正常，请在对端生成配对码', { exact: false })).toBeVisible()
+        await page.getByRole('button', { name: '允许连接本机', exact: true }).click()
+        await page.getByRole('combobox', { name: '首次配对的账号关系', exact: true }).click()
+        await page.getByRole('option', { name: '我已确认使用同一账号', exact: true }).click()
+        await page.getByRole('button', { name: '生成配对码', exact: true }).click()
+        await expect(page.locator('.code')).toHaveText(/^\d{8}$/)
+        const pairingCode = (await page.locator('.code').innerText()).trim()
+        const aPage = await open(a)
+        await aPage.getByRole('button', { name: '设备', exact: true }).click()
+        await expect(aPage.locator('.dl-popover .empty')).toContainText('连接另一台设备，访问它的工作区')
+        await expect(aPage.locator('.dl-popover').getByRole('button', { name: /连接设备/ })).toHaveCount(1)
+        await aPage.getByRole('button', { name: '＋ 连接设备', exact: true }).click()
+        await aPage.getByLabel('设备地址', { exact: true }).fill(`http://${sb.listen.host}:${sb.listen.port}`)
+        await aPage.getByLabel('配对码', { exact: true }).fill(pairingCode)
+        await aPage.getByRole('button', { name: '连接设备', exact: true }).click()
+        await aPage.getByRole('button', { name: /harness-b.*在线/ }).click()
+        await aPage.getByRole('button', { name: '管理设备', exact: true }).click()
+        const popupPromise = aPage.waitForEvent('popup')
+        await aPage.getByRole('button', { name: '打开设备界面 ↗', exact: true }).click()
+        const popup = await popupPromise
+        await popup.getByRole('button', { name: '账号菜单', exact: true }).waitFor()
+        assert.equal(new URL(popup.url()).port, String(sb.listen.port))
+        await capture(popup, 'proxied-harness')
+        await popup.close()
+        await page.getByRole('button', { name: '关闭设备面板', exact: true }).click()
+        await page.getByRole('button', { name: '设备', exact: true }).click()
+        await page.getByRole('button', { name: /harness-a.*在线/ }).click()
+        await page.getByRole('button', { name: '收藏 workspace', exact: true }).click()
+        await capture(page, 'device-detail')
+        await page.getByRole('button', { name: '‹ 设备列表', exact: true }).click()
+        await page.getByRole('tab', { name: '工作区', exact: true }).click()
+        await expect(page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true })).toBeVisible()
+        await page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true }).click()
+        await page.getByRole('button', { name: '引用工作区', exact: true }).click()
+        const composer = page.getByRole('textbox', { name: /\/ 调用指令, @ 文件或对话$/ })
+        await expect(composer).toContainText('harness-a › workspace')
+        await capture(page, 'workspace-preview-reference')
+        await page.reload()
+        await page.getByRole('button', { name: '设备', exact: true }).click()
+        await page.getByRole('tab', { name: '工作区', exact: true }).click()
+        await expect(page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true })).toBeVisible()
+        await page.getByRole('button', { name: '关闭设备面板', exact: true }).click()
+        await composer.fill('@harness-a')
+        await page.getByRole('option').filter({ hasText: path.join(a.home, 'workspace') }).first().click()
+        await expect(composer).toContainText('harness-a › workspace')
+        if (modelConfigured) {
+          await composer.press('End')
+          await composer.pressSequentially(' 请调用 device_delegate 在引用的设备和工作区委派任务，让对方设备回复 WORKSPACE_MENTION_OK。')
+          await page.getByRole('button', { name: '发送消息', exact: true }).click()
+          const card = page.locator('.dl-task').filter({ hasText: 'WORKSPACE_MENTION_OK' }).first()
+          await expect(card.locator('.task-state')).toHaveText('已完成', { timeout: 120_000 })
+          await expect(card.locator('.dl-excerpt')).toContainText('WORKSPACE_MENTION_OK')
+          await expect.poll(async () => (await api<DeviceState>(b, 'state')).host.agents.some(agent => agent.status === 'running'), { timeout: 120_000 }).toBe(false)
+          await expect(page.locator('.dl').getByText('value is not lossless JSON', { exact: false })).toHaveCount(0)
+          await capture(page, 'workspace-mention-result')
+          await composer.fill('返回本地后保留的草稿')
+          if (!await card.locator('.dl-task-link').isVisible()) await page.getByRole('button', { name: /^已完成，用时/ }).last().click()
+          if (!await card.locator('.dl-task-link').isVisible()) await page.getByRole('button', { name: '已调用工具', exact: true }).last().click()
+          await card.locator('.dl-task-link').click()
+          await expect(page.locator('.dl-transcript')).toContainText('WORKSPACE_MENTION_OK')
+          await page.getByRole('button', { name: '‹ 返回本地会话', exact: true }).click()
+          await expect(composer).toContainText('返回本地后保留的草稿')
+          await composer.fill('')
+          await page.getByRole('button', { name: '设备', exact: true }).click()
+          await page.getByRole('tab', { name: '工作区', exact: true }).click()
+          await page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true }).click()
+          await page.getByRole('button', { name: '新建任务', exact: true }).click()
+          const beforeModel = (await api<DeviceState>(a, 'state')).host.model
+          const execution = await api<ExecutionContext>(b, 'execution', {deviceId: peerId, workspacePath: executionWorkspace})
+          const modelPicker = page.getByRole('button', {name: /^模型与思考强度/})
+          await expect(modelPicker).toBeVisible()
+          const modelChoices = execution.catalog.groups.flatMap(group => group.models.map(model => ({provider:group.id,model:model.id,name:model.name})))
+          const chosen = modelChoices.find(model => model.model !== execution.selected.model) ?? modelChoices.find(model => model.model === execution.selected.model)!
+          await modelPicker.click()
+          await page.getByRole('menuitem', {name: /^模型/}).click()
+          await page.getByRole('menuitemradio', {name: chosen.name, exact: true}).click()
+          await page.getByLabel('设备任务内容').fill('只回复 FORM_DELEGATE_OK。')
+          await page.reload()
+          await page.getByRole('button', { name: '设备任务', exact: true }).click()
+          await expect(page.getByLabel('设备任务内容')).toHaveValue('只回复 FORM_DELEGATE_OK。')
+          await expect(modelPicker).toContainText(chosen.name)
+          await page.route('**/device-link/api/task-start', async route => {
+            await route.fetch()
+            await route.abort('failed')
+          }, { times: 1 })
+          await page.getByRole('button', { name: '开始任务', exact: true }).click()
+          const direct = page.locator('.dl-turn').filter({ hasText: '只回复 FORM_DELEGATE_OK。' }).first()
+          await expect(direct.locator('.dl-turn-status')).toContainText('已完成', { timeout: 120_000 })
+          await expect(direct.locator('.assistant')).toContainText('FORM_DELEGATE_OK')
+          const firstTask = (await api<{tasks:OutgoingTask[]}>(b,'tasks')).tasks.find(task=>task.prompt==='只回复 FORM_DELEGATE_OK。')!
+          assert.equal((await api<{tasks:OutgoingTask[]}>(b,'tasks')).tasks.filter(task=>task.prompt==='只回复 FORM_DELEGATE_OK。').length,1)
+          assert.equal(firstTask.remote?.model,chosen.model)
+          assert.deepEqual((await api<DeviceState>(a,'state')).host.model,beforeModel)
+          await page.getByLabel('设备任务内容').fill('只回复 UI_CONTINUE_OK。')
+          await page.getByRole('button', { name: '发送', exact: true }).click()
+          const continued = page.locator('.dl-turn').filter({ hasText: '只回复 UI_CONTINUE_OK。' }).first()
+          await expect(continued.locator('.dl-turn-status')).toContainText('已完成', { timeout: 120_000 })
+          const secondTask = (await api<{tasks:OutgoingTask[]}>(b,'tasks')).tasks.find(task=>task.prompt==='只回复 UI_CONTINUE_OK。')!
+          assert.equal(secondTask.remote?.sessionId,firstTask.remote?.sessionId)
+          await page.getByLabel('设备任务内容').fill('尚未发送的下一条草稿')
+          await page.reload()
+          await page.getByRole('button', { name: '设备任务', exact: true }).click()
+          await expect(page.getByLabel('设备任务内容')).toHaveValue('尚未发送的下一条草稿')
+          await expect(continued.locator('.assistant')).toContainText('UI_CONTINUE_OK')
+          await expect(page.locator('.dl-user-bubble').filter({hasText:'只回复 FORM_DELEGATE_OK。'})).toHaveCount(1)
+          await expect(page.locator('.dl-user-bubble').filter({hasText:'只回复 UI_CONTINUE_OK。'})).toHaveCount(1)
+          await capture(page, 'persistent-task-cards')
+          await page.setViewportSize({width:900,height:764})
+          await expect(page.getByLabel('设备任务内容')).toBeInViewport()
+          await expect(page.getByRole('button', {name:'发送',exact:true})).toBeInViewport()
+          await capture(page, 'conversation-narrow')
+          await page.setViewportSize({width:1440,height:960})
+          await page.getByRole('button', { name: '返回工作区', exact: true }).click()
+          await expect.poll(async () => (await api<DeviceState>(b, 'state')).host.agents.some(agent => agent.status === 'running'), { timeout: 120_000 }).toBe(false)
+          await api(b, 'sync', { deviceId: peerId })
+          stop(a.child)
+          await api(b, 'sync', { deviceId: peerId })
+          await page.getByRole('button', { name: '新建会话', exact: true }).first().click()
+          const cachedTitle=(await api<DeviceState>(b,'state')).peers.find(peer=>peer.deviceId===peerId)!.status!.host.sessions.find(session=>session.id===fileSessionId)!.title
+          await composer.fill('@harness-a')
+          await page.getByRole('option').filter({ hasText: cachedTitle }).click()
+          await composer.press('End')
+          await composer.pressSequentially(' 设备当前离线。请从引用的会话缓存中找出此前回复中的 DEVICE_FILE_ 标识并原样回复。')
+          await page.getByRole('button', { name: '发送消息', exact: true }).click()
+          await expect(page.getByText(marker, { exact: true }).first()).toBeVisible({ timeout: 120_000 })
+          await expect.poll(async () => (await api<DeviceState>(b, 'state')).host.agents.some(agent => agent.status === 'running'), { timeout: 120_000 }).toBe(false)
+          await expect(page.locator('.dl-reference')).toHaveCount(1)
+          await capture(page, 'offline-session-reference')
+          await page.locator('.dl-reference').click()
+          await expect(page.getByRole('complementary', { name: '设备预览' })).toContainText(marker)
+          await capture(page, 'sent-session-snapshot')
+          await page.getByRole('button', { name: '关闭设备预览', exact: true }).click()
+          a = await start('a', sa.listen.port)
+          await api(b, 'sync', { deviceId: peerId })
+        }
+        await page.getByRole('button', { name: '设备', exact: true }).click()
+        await page.getByRole('button', { name: '连接设置', exact: true }).click()
+        const settings = page.getByRole('dialog', { name: '设备连接设置', exact: true })
+        const toggle = settings.getByRole('checkbox', { name: '允许局域网设备连接', exact: true })
+        await toggle.click()
+        await expect.poll(async () => (await api<DeviceState>(b, 'state')).allowIncoming).toBe(false)
+        await expect(toggle).not.toBeChecked()
+        await toggle.click()
+        await expect.poll(async () => (await api<DeviceState>(b, 'state')).allowIncoming).toBe(true)
+        await expect(toggle).toBeChecked()
+        const trusted = settings.locator('article').filter({ has: page.getByRole('heading', { name: 'harness-a', exact: true }) })
+        await trusted.getByText('修改授权', { exact: true }).click()
+        await trusted.getByRole('combobox', { name: '会话同步', exact: true }).click()
+        await page.getByRole('option', { name: '会话目录', exact: true }).click()
+        await trusted.getByRole('button', { name: '保存范围', exact: true }).click()
+        await expect.poll(async () => (await api<DeviceState>(b, 'state')).trusted[0]?.scope.sessionSync).toBe('metadata')
+        await trusted.getByRole('button', { name: '撤销授权', exact: true }).click()
+        await expect(trusted).toHaveCount(0)
+        await capture(page, 'device-settings')
+        await settings.getByRole('button', { name: '关闭连接设置', exact: true }).click()
+        const closePreview = page.getByRole('button', { name: '收起右侧边栏', exact: true })
+        if (await closePreview.isVisible()) await closePreview.click()
+        await page.getByRole('button', { name: '收起侧边栏', exact: true }).click()
+        await expect(page.locator('.device-trigger')).toHaveClass(/rail/)
+        await expect.poll(async () => (await page!.locator('.dl-footer').boundingBox())?.width ?? Infinity).toBeLessThan(50)
+        await assertFooterLayout(page)
+        await capture(page, 'device-footer-collapsed')
+        await page.setViewportSize({ width: 760, height: 840 })
+        await assertFooterLayout(page)
+        await page.getByRole('button', { name: '设备', exact: true }).click()
+        await capture(page, 'device-panel-narrow')
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false)
+        await page.keyboard.press('Escape')
+        await expect(page.getByRole('dialog', { name: '设备面板', exact: true })).toHaveCount(0)
         assert.deepEqual(errors, [])
-      } finally { await browser.close() }
+      } catch (error) {
+        if (page) await capture(page, 'browser-failure')
+        throw error
+      } finally {
+        if (a.child.exitCode !== null) a = await start('a', sa.listen.port)
+        await browser.close()
+      }
     })
   }
   await step('restricted grants close full UI access and filter session sync', async () => {
@@ -179,5 +536,7 @@ try {
   if (path.dirname(resolved) !== path.resolve(os.tmpdir()) || !path.basename(resolved).startsWith('device-link-e2e-')) throw new Error('invalid cleanup root')
   await fs.rm(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
 }
+await fs.mkdir(path.join(project, '.e2e'), { recursive: true })
+await fs.writeFile(path.join(project, '.e2e', 'acceptance.json'), JSON.stringify({ completedAt: new Date().toISOString(), modelConfigured, passed, failed, tests: report }, null, 2))
 console.log(`${passed} passed, ${failed} failed`)
 process.exitCode = failed ? 1 : 0
