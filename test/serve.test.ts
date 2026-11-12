@@ -1,16 +1,10 @@
-/**
- * Integration-level tests for lib/serve.js and lib/pairing.js.
- *
- * Each harness starts a real node:http listener on 127.0.0.1:0 with a temporary
- * store under os.tmpdir(), a stub owner-credentials object and a stub GUI proxy.
- */
-
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import { defaultScope } from '../src/lib/scope.ts'
 import { APP_VERSION } from '../src/lib/types.ts'
@@ -25,21 +19,20 @@ import { createDeviceLinkServer } from '../src/lib/serve.ts'
 
 const silentLog = { info() {}, warn() {}, error() {} }
 
-function delay(milliseconds) {
-  return new Promise(resolve => setTimeout(resolve, milliseconds))
-}
-
-async function makeHarness(overrides = {}) {
+type ServerOptions = Parameters<typeof createDeviceLinkServer>[0]
+type HarnessOverrides = Partial<ServerOptions['config']> & { pairingTtlMs?: number; start?: boolean }
+async function makeHarness(overrides: HarnessOverrides = {}) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-device-link-serve-'))
   const store = await openStore({ home, log: silentLog })
   const pairing = createPairing({
-    open: false,
     ttlMs: overrides.pairingTtlMs ?? 60_000,
   })
 
-  const recorded = { handles: [], upgrades: [] }
-  const credentials = { getCookie: async () => 'sid=stub' }
-  const proxy = {
+  const recorded: {
+    handles: { url?: string; cookie: string | null; authorization: string | null }[]
+    upgrades: { url?: string; cookie: string | null; headLength: number }[]
+  } = { handles: [], upgrades: [] }
+  const proxy: ServerOptions['proxy'] = {
     async handle(req, res) {
       recorded.handles.push({
         url: req.url,
@@ -60,11 +53,11 @@ async function makeHarness(overrides = {}) {
     },
   }
 
-  const warnings = []
+  const warnings: string[] = []
   const log = {
     info() {},
-    warn: (...args) => warnings.push(args.join(' ')),
-    error(...args) {
+    warn: (...args: unknown[]) => warnings.push(args.join(' ')),
+    error(...args: unknown[]) {
       warnings.push(args.join(' '))
     },
   }
@@ -73,23 +66,19 @@ async function makeHarness(overrides = {}) {
     config: {
       port: overrides.port ?? 0,
       bindAddress: overrides.bindAddress ?? '127.0.0.1',
-      deviceName: 'serve-test-host',
       allowIncoming: overrides.allowIncoming ?? true,
       accessTtlMs: overrides.accessTtlMs ?? 60_000,
       maxPairFailures: overrides.maxPairFailures ?? 8,
       failureWindowMs: overrides.failureWindowMs ?? 10 * 60_000,
-      guiOrigin: 'http://127.0.0.1:1',
     },
     store,
     pairing,
-    credentials,
     proxy,
     log,
   })
 
   let listen = null
   if (overrides.start !== false) listen = await server.start()
-  const baseUrl = listen ? `http://${listen.host}:${listen.port}` : null
 
   return {
     home,
@@ -99,8 +88,8 @@ async function makeHarness(overrides = {}) {
     proxy,
     recorded,
     warnings,
-    listen,
-    baseUrl,
+    get listen() { assert.ok(listen); return listen },
+    get baseUrl() { assert.ok(listen); return `http://${listen.host}:${listen.port}` },
     async cleanup() {
       await server.stop()
       await fs.rm(home, { recursive: true, force: true })
@@ -108,7 +97,7 @@ async function makeHarness(overrides = {}) {
   }
 }
 
-async function request(url, options = {}) {
+async function request(url: string, options: { method?: string; body?: unknown; token?: string; cookie?: string; redirect?: RequestRedirect; headers?: Record<string, string> } = {}) {
   const { method = 'GET', body, token, cookie, redirect = 'follow', headers = {} } = options
   const finalHeaders = { ...headers }
   if (body !== undefined) finalHeaders['content-type'] ??= 'application/json'
@@ -122,16 +111,16 @@ async function request(url, options = {}) {
     redirect,
   })
   const text = await response.text()
-  let json = null
+  let json: Record<string, unknown> = {}
   try {
-    json = text ? JSON.parse(text) : null
+    json = text ? JSON.parse(text) : {}
   } catch {
-    json = null
+    json = {}
   }
   return { response, status: response.status, text, json, headers: response.headers }
 }
 
-async function pairDevice(harness, { deviceId = 'peer-device', name = 'Peer Device' } = {}) {
+async function pairDevice(harness: Awaited<ReturnType<typeof makeHarness>>, { deviceId = 'peer-device', name = 'Peer Device' } = {}) {
   const opened = harness.server.openPairing({ relationship: 'same-account', scope: defaultScope('same-account') })
   const claim = await request(`${harness.baseUrl}/dl/pair/claim`, {
     method: 'POST',
@@ -139,22 +128,17 @@ async function pairDevice(harness, { deviceId = 'peer-device', name = 'Peer Devi
   })
   assert.equal(claim.status, 200, `claim failed: ${claim.text}`)
   assert.equal(claim.json?.ok, true)
+  assert.ok(typeof claim.json.token === 'string')
   return { opened, claim, token: claim.json.token }
 }
 
-function setCookies(response) {
-  if (typeof response.headers.getSetCookie === 'function') return response.headers.getSetCookie()
-  const single = response.headers.get('set-cookie')
-  return single ? [single] : []
-}
-
-function rawUpgrade(port, pathname, extraHeaders = {}) {
-  return new Promise(resolve => {
+function rawUpgrade(port: number, pathname: string, extraHeaders: Record<string, string> = {}) {
+  return new Promise<{ data: string; timedOut: boolean }>(resolve => {
     const socket = net.connect({ host: '127.0.0.1', port })
     let data = ''
     let settled = false
     const timer = setTimeout(() => finish(true), 2000)
-    function finish(timedOut) {
+    function finish(timedOut: boolean) {
       if (settled) return
       settled = true
       clearTimeout(timer)
@@ -180,9 +164,7 @@ function rawUpgrade(port, pathname, extraHeaders = {}) {
   })
 }
 
-// --------------------------------------------------------------------- pairing
-
-test('device tokens are random, hashed, and verified in constant time', () => {
+test('device tokens are random and verify only against their stored hashes', () => {
   const first = createDeviceToken()
   const second = createDeviceToken()
 
@@ -192,13 +174,11 @@ test('device tokens are random, hashed, and verified in constant time', () => {
   assert.match(first.tokenHash, /^[0-9a-f]{64}$/)
   assert.notEqual(first.token, second.token)
 
-  assert.equal(first.hash, hashToken)
   assert.equal(first.tokenHash, hashToken(first.token))
   assert.equal(verifyToken(first.token, first.tokenHash), true)
   assert.equal(verifyToken(second.token, first.tokenHash), false)
   assert.equal(verifyToken(`${first.token}x`, first.tokenHash), false)
-  // Stored hashes are lower-case hex; verification accepts upper case too.
-  assert.equal(verifyToken(first.token, first.tokenHash.toUpperCase()), true)
+  assert.equal(verifyToken(first.token, first.tokenHash.toUpperCase()), false)
   assert.equal(verifyToken('', first.tokenHash), false)
   assert.equal(verifyToken(first.token, ''), false)
   assert.equal(verifyToken(first.token, null), false)
@@ -222,21 +202,21 @@ test('pairing codes are 8 digits, single use, TTL-bound, and burn after too many
   assert.deepEqual(expiring.consume(shortLived.code, 'ip-a'), { ok: false, reason: 'expired' })
 
   const limited = createPairing({ ttlMs: 60_000, maxAttempts: 2 })
-  limited.openPairing()
-  assert.deepEqual(limited.consume('00000000', 'ip-a'), { ok: false, reason: 'mismatch' })
-  assert.deepEqual(limited.consume('00000000', 'ip-a'), { ok: false, reason: 'attempts' })
+  const limitedCode = limited.openPairing().code
+  const wrong = limitedCode === '00000000' ? '00000001' : '00000000'
+  assert.deepEqual(limited.consume(wrong, 'ip-a'), { ok: false, reason: 'mismatch' })
+  assert.deepEqual(limited.consume(wrong, 'ip-a'), { ok: false, reason: 'attempts' })
   assert.equal(limited.isOpen(), false)
 
   const reset = createPairing({ ttlMs: 60_000 })
-  const first = reset.openPairing()
-  reset.consume('99999999', 'ip-a')
+  reset.openPairing()
+  reset.consume('invalid', 'ip-a')
   const second = reset.openPairing()
-  assert.notEqual(first.code, second.code)
+  assert.deepEqual(reset.consume(second.code, 'ip-a'), { ok: true })
+  reset.openPairing()
   reset.closePairing()
   assert.equal(reset.isOpen(), false)
 })
-
-// --------------------------------------------------------------------- serve
 
 test('GET /dl/info answers without auth and reports identity', async () => {
   const harness = await makeHarness()
@@ -257,8 +237,7 @@ test('GET /dl/info answers without auth and reports identity', async () => {
       host: harness.listen.host,
       port: harness.listen.port,
     })
-    assert.deepEqual(harness.server.addresses(), harness.server.addresses()) // stable array
-    assert.ok(Array.isArray(harness.server.addresses()))
+    assert.deepEqual(harness.server.addresses(), [harness.listen.host])
   } finally {
     await harness.cleanup()
   }
@@ -282,12 +261,11 @@ test('open pairing → claim → access → enter grants a session cookie', asyn
     })
     assert.equal(claim.status, 200, claim.text)
     assert.equal(claim.json.ok, true)
-    assert.equal(typeof claim.json.token, 'string')
+    assert.ok(typeof claim.json.token === 'string')
     assert.equal(claim.json.deviceId, harness.store.state().identity.deviceId)
     assert.equal(claim.json.name, harness.store.state().identity.name)
     assert.equal(claim.json.api, 'v2')
 
-    // Pairing is one-time; the code cannot be claimed twice.
     assert.equal(harness.pairing.isOpen(), false)
     const replay = await request(`${harness.baseUrl}/dl/pair/claim`, {
       method: 'POST',
@@ -317,13 +295,15 @@ test('open pairing → claim → access → enter grants a session cookie', asyn
     })
     assert.equal(access.status, 200, access.text)
     assert.equal(access.json.ok, true)
+    assert.ok(typeof access.json.url === 'string')
+    assert.ok(typeof access.json.expiresAt === 'string')
     assert.ok(access.json.url.startsWith(`${harness.baseUrl}/dl/enter?ac=`), access.json.url)
     assert.ok(Date.parse(access.json.expiresAt) > Date.now())
 
     const enter = await request(access.json.url, { redirect: 'manual' })
     assert.equal(enter.status, 302)
     assert.equal(enter.headers.get('location'), '/')
-    const cookies = setCookies(enter.response)
+    const cookies = enter.headers.getSetCookie()
     const session = cookies.find(value => value.startsWith('dl_session='))
     assert.ok(session, `missing dl_session cookie, got ${JSON.stringify(cookies)}`)
     assert.match(session, /HttpOnly/)
@@ -331,7 +311,6 @@ test('open pairing → claim → access → enter grants a session cookie', asyn
     assert.match(session, /Path=\//)
     assert.equal(session.split(';')[0], `dl_session=${claim.json.token}`)
 
-    // The cookie from /dl/enter authenticates proxied requests.
     const cookie = session.split(';')[0]
     const proxied = await request(`${harness.baseUrl}/`, { cookie })
     assert.equal(proxied.status, 200)
@@ -402,7 +381,6 @@ test('revoking a device drops its token and rejects later requests', async () =>
     const beta = await pairDevice(harness, { deviceId: 'device-beta', name: 'Beta' })
     assert.equal(harness.server.trusted().length, 2)
 
-    // A device can only revoke itself.
     const forbidden = await request(`${harness.baseUrl}/dl/pair/revoke`, {
       method: 'POST',
       token: alpha.token,
@@ -428,7 +406,6 @@ test('revoking a device drops its token and rejects later requests', async () =>
     const betaStillWorks = await request(`${harness.baseUrl}/`, { token: beta.token })
     assert.equal(betaStillWorks.status, 200)
 
-    // server.revoke() is idempotent: true once, false afterwards.
     assert.equal(await harness.server.revoke('device-beta'), true)
     assert.equal(await harness.server.revoke('device-beta'), false)
     assert.equal(harness.server.trusted().length, 0)
@@ -458,11 +435,11 @@ test('wrong pairing codes report mismatch, then attempts, then rate limiting', a
         body: { code: wrong, deviceId: 'device-x', name: 'X' },
       })
     }
+    assert.ok(last)
     assert.equal(last.status, 429)
     assert.equal(last.json.reason, 'attempts')
     assert.equal(harness.pairing.isOpen(), false)
 
-    // The IP is now rate limited, even for the right code.
     const limited = await request(`${harness.baseUrl}/dl/pair/claim`, {
       method: 'POST',
       body: { code: opened.code, deviceId: 'device-x', name: 'X' },
@@ -470,7 +447,6 @@ test('wrong pairing codes report mismatch, then attempts, then rate limiting', a
     assert.equal(limited.status, 429)
     assert.equal(limited.json.reason, 'rate_limited')
 
-    // Re-opening pairing (an owner action) resets the failure counter.
     const reopened = harness.server.openPairing({ relationship: 'same-account', scope: defaultScope('same-account') })
     const success = await request(`${harness.baseUrl}/dl/pair/claim`, {
       method: 'POST',
@@ -506,6 +482,7 @@ test('access codes are single use, TTL-bound, and tamper-proof', async () => {
     const { token } = await pairDevice(harness, { deviceId: 'device-ac', name: 'AC Device' })
     const access = await request(`${harness.baseUrl}/dl/access`, { method: 'POST', token })
     assert.equal(access.status, 200)
+    assert.ok(typeof access.json.url === 'string')
 
     const firstEnter = await request(access.json.url, { redirect: 'manual' })
     assert.equal(firstEnter.status, 302)
@@ -522,7 +499,6 @@ test('access codes are single use, TTL-bound, and tamper-proof', async () => {
     const missing = await request(`${harness.baseUrl}/dl/enter`, { redirect: 'manual' })
     assert.equal(missing.status, 401)
 
-    // An access code without a token does not work either.
     const anonymousAccess = await request(`${harness.baseUrl}/dl/access`, { method: 'POST' })
     assert.equal(anonymousAccess.status, 401)
   } finally {
@@ -536,6 +512,7 @@ test('access codes expire after accessTtlMs', async () => {
     const { token } = await pairDevice(harness, { deviceId: 'device-ac2', name: 'AC Device 2' })
     const access = await request(`${harness.baseUrl}/dl/access`, { method: 'POST', token })
     assert.equal(access.status, 200)
+    assert.ok(typeof access.json.url === 'string')
     await delay(60)
     const enter = await request(access.json.url, { redirect: 'manual' })
     assert.equal(enter.status, 401)
@@ -584,7 +561,6 @@ test('pairing claims refuse malformed, oversized, and non-string bodies', async 
     assert.equal(oversized.status, 413)
     assert.equal(oversized.json.reason, 'invalid_request')
 
-    // None of the rejected requests paired anything.
     assert.equal(harness.server.trusted().length, 0)
   } finally {
     await harness.cleanup()
@@ -656,7 +632,6 @@ test('stop() closes the listener and destroys client sockets', async () => {
   await harness.server.stop()
   assert.equal(harness.server.info().listen, null)
   await assert.rejects(() => fetch(`${baseUrl}/dl/info`))
-  // stop() is idempotent.
   await harness.server.stop()
   await fs.rm(harness.home, { recursive: true, force: true })
 })

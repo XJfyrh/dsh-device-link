@@ -3,17 +3,19 @@ import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { buildSync } from 'esbuild'
 import { sentReferenceRule, createClientState, draftKey } from '../src/client/state.ts'
+import type { ClientContext } from '../src/client/contracts.ts'
+import type { OutgoingTask } from '../src/lib/types.ts'
 
 test('@ input source offers cached workspace/session references without probing an offline peer', async () => {
   const compiled = buildSync({ entryPoints: ['src/client.tsx'], bundle: true, format: 'iife', write: false }).outputFiles[0].text
-  let plugin
-  let trigger
+  let plugin: ReturnType<Parameters<Window['__ModuleLoader__']['load']>[0]['factory']> | undefined
+  let trigger: Parameters<ClientContext['inputTriggers']['registerSource']>[0] | undefined
   const routes: string[] = []
   const effects: (() => unknown)[] = []
   vm.runInNewContext(compiled, {
     AbortController, URL,
-    window: { __ModuleLoader__: { load(definition) { plugin = definition.factory(() => ({})) } } },
-    fetch: async route => {
+    window: { __ModuleLoader__: { load(definition: Parameters<Window['__ModuleLoader__']['load']>[0]) { plugin = definition.factory((() => ({})) as never) } } },
+    fetch: async (route: string) => {
       routes.push(route)
       return { ok: true, json: async () => ({ ok: true, peers: [{ deviceId: 'remote', name: 'Lab PC', online: false, cachedAt: '2026-11-09T00:00:00Z', cachedSessionIds: ['session-1'], status: { host: {
         workspaces: [{ id: 'w', title: 'My Project', path: '/My Project' }],
@@ -21,8 +23,15 @@ test('@ input source offers cached workspace/session references without probing 
       } } }] }) }
     },
   })
-  plugin.apply({ slots: { inject(_name, callback) { callback() }, register() {} }, effect(factory) { effects.push(factory) }, inputTriggers: { registerSource(value) { trigger = value; return () => {} } } })
+  assert.ok(plugin)
+  const context: Pick<ClientContext, 'slots' | 'effect' | 'inputTriggers'> = {
+    slots: { inject(_name, callback) { callback() }, register() {} },
+    effect(factory) { effects.push(factory) },
+    inputTriggers: { registerSource(value) { trigger = value; return () => {} } },
+  }
+  plugin.apply(context as ClientContext)
   effects.at(-1)!()
+  assert.ok(trigger)
   assert.equal(trigger.trigger, '@')
   const candidates = await trigger.candidates({}, { query: 'Lab', signal: new AbortController().signal })
   assert.equal(candidates.length, 2)
@@ -55,18 +64,19 @@ test('browser submission persists its identity before a lost response and restor
   const originalFetch = globalThis.fetch
   const previousWindow = globalThis.window
   const storage = new Map<string,string>()
-  let savedTask: any
+  let savedTask: OutgoingTask | undefined
   let submissions=0
-  globalThis.window = {localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value)}} as never
+  globalThis.window = {localStorage:{getItem:(key: string)=>storage.get(key)??null,setItem:(key: string,value: string)=>storage.set(key,value)}} as never
   const data = {identity:{deviceId:'local'},peers:[{deviceId:'remote',name:'Remote'}]}
   globalThis.fetch = async (url, init) => {
     const route=String(url).split('/').at(-1)
     if(route==='task-start') {
       submissions++
-      const input=JSON.parse(String(init?.body))
-      const persisted=JSON.parse(storage.get('device-link-0.4:local')!)
-      assert.equal(persisted.localTasks[input.id].prompt,'task')
-      savedTask={...persisted.localTasks[input.id],submission:'accepted',remote:{id:input.id,sessionId:'session',status:'running'}}
+      const input=JSON.parse(String(init?.body)) as { id: string }
+      const persisted=JSON.parse(storage.get('device-link-0.4:local')!) as { localTasks: Record<string, OutgoingTask> }
+      const local = persisted.localTasks[input.id]
+      assert.equal(local.prompt,'task')
+      savedTask={...local,submission:'accepted',remote:{id:input.id,sessionId:'session',status:'running',workspacePath:local.workspacePath,prompt:local.prompt,createdAt:local.createdAt,updatedAt:local.createdAt,text:''}}
       throw new Error('response lost')
     }
     return {ok:true,json:async()=>route==='state'?data:{tasks:savedTask?[savedTask]:[]}} as Response
@@ -87,4 +97,53 @@ test('browser submission persists its identity before a lost response and restor
     assert.equal(restored.getSnapshot().drafts[draftKey(other)].text,'other draft')
     assert.equal(submissions,1)
   } finally {globalThis.fetch=originalFetch;globalThis.window=previousWindow}
+})
+
+for (const response of ['lost', 'stale'] as const) test(`a ${response} submission response cannot replace a task already confirmed by refresh`, async () => {
+  const originalFetch = globalThis.fetch
+  const previousWindow = globalThis.window
+  const storage = new Map<string, string>()
+  let savedTask: OutgoingTask | undefined
+  let rejectSubmission!: (reason: Error) => void
+  let resolveSubmission!: (response: Response) => void
+  const submissionResponse = new Promise<Response>((resolve, reject) => { rejectSubmission = reject; resolveSubmission = resolve })
+  globalThis.window = { localStorage: {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => storage.set(key, value),
+  } } as never
+  globalThis.fetch = async (url, init) => {
+    const route = String(url).split('/').at(-1)
+    if (route === 'task-start') {
+      const input = JSON.parse(String(init?.body)) as { id: string }
+      const persisted = JSON.parse(storage.get('device-link-0.4:local')!) as { localTasks: Record<string, OutgoingTask> }
+      const local = persisted.localTasks[input.id]
+      savedTask = { ...local, submission: 'accepted', remote: {
+        id: local.id, sessionId: 'session', workspacePath: local.workspacePath, prompt: local.prompt,
+        status: 'completed', createdAt: local.createdAt, updatedAt: new Date(Date.parse(local.createdAt) + 1000).toISOString(), text: 'done',
+      } }
+      return submissionResponse
+    }
+    return { ok: true, json: async () => route === 'state'
+      ? { identity: { deviceId: 'local' }, peers: [{ deviceId: 'remote', name: 'Remote' }] }
+      : { tasks: savedTask ? [savedTask] : [] } } as Response
+  }
+  try {
+    const state = createClientState({} as never)
+    await state.refresh()
+    const submitting = state.submitTask({ deviceId: 'remote', workspace: '/work', title: 'Work' }, { text: 'task' })
+    await state.refresh()
+    assert.equal(state.getSnapshot().tasks[0].remote?.status, 'completed')
+    if (response === 'lost') rejectSubmission(new Error('late connection failure'))
+    else {
+      assert.ok(savedTask?.remote)
+      const earlierTask: OutgoingTask = { ...savedTask, remote: { ...savedTask.remote, status: 'running', updatedAt: savedTask.createdAt, text: '' } }
+      resolveSubmission({ ok: true, json: async () => ({ task: earlierTask }) } as Response)
+    }
+    const result = await submitting
+    assert.equal(result.remote?.status, 'completed')
+    assert.equal(state.getSnapshot().tasks[0].submission, 'accepted')
+    assert.equal(state.getSnapshot().tasks[0].remote?.text, 'done')
+    const persisted = JSON.parse(storage.get('device-link-0.4:local')!) as { localTasks: Record<string, OutgoingTask> }
+    assert.deepEqual(persisted.localTasks, {})
+  } finally { globalThis.fetch = originalFetch; globalThis.window = previousWindow }
 })

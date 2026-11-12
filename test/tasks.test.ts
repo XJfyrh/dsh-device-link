@@ -10,7 +10,7 @@ import { createTaskManager } from '../src/lib/tasks.ts'
 import { createOutgoingTasks } from '../src/lib/outgoing-tasks.ts'
 import { delegationEnd, delegationText } from '../src/lib/delegation.ts'
 import { HttpError, type DelegateInput, type DelegateResult, type TrustedDevice, type DeviceTask } from '../src/lib/types.ts'
-import type { HostEvent } from '../src/lib/host.ts'
+import type { HostEvent, HostServices } from '../src/lib/host.ts'
 
 async function fixture(t: TestContext, run: (input: DelegateInput) => Promise<DelegateResult>) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'device-tasks-'))
@@ -91,7 +91,8 @@ test('restart reconciles durable completion without submitting again', async t =
     id: 'job', ownerDeviceId: 'owner', tokenHash: 'token', sessionId: 'session', workspacePath: h.directory,
     prompt: 'hello', promptRequestId: 'device-link-job', resume: false, baselineSeq: 0, status: 'running', text: '', createdAt: '', updatedAt: '',
   } })
-  const restarted = await createTaskManager({ store: h.store, ctx: { get: name => name === 'sessionQuery' ? { readSession: async () => ({ events }) } : undefined } as never, run: async () => { throw new Error('must not run') } })
+  const services: Partial<HostServices> = { sessionQuery: { listSessions: async () => [], readSession: async () => ({ session: { id: 'session', cwd: h.directory }, events }) } }
+  const restarted = await createTaskManager({ store: h.store, ctx: { get: name => services[name] }, run: async () => { throw new Error('must not run') } })
   assert.equal(restarted.get(h.owner, 'job').status, 'completed')
   assert.equal(restarted.get(h.owner, 'job').text, 'right')
   await restarted.dispose()
@@ -118,4 +119,30 @@ test('outgoing retries use one identity and completed cancellation does not loop
   await outgoing.refresh('job')
   assert.equal(outgoing.get('job').cancelRequested, undefined)
   assert.equal(cancels, 1)
+})
+
+test('outgoing wait expiry returns current state and leaves the remote task running', async t => {
+  const h = await fixture(t, async () => { throw new Error('unused') })
+  const peer = { deviceId: 'peer', token: 'token', name: 'peer', baseUrl: 'http://127.0.0.1:1', createdAt: '', lastSeenAt: '' }
+  await h.store.update(draft => { draft.peers.peer = peer })
+  let cancels = 0
+  const remote: DeviceTask = { id: 'job', sessionId: 'session', workspacePath: h.directory, prompt: 'hello', status: 'running', createdAt: '', updatedAt: new Date().toISOString(), text: 'partial' }
+  const connector = {
+    async readTask() { return { ...remote } },
+    async cancelTask() { cancels++; return { task: { ...remote, status: 'stopped' }, cancelled: true } },
+  }
+  const outgoing = createOutgoingTasks({ store: h.store, connector: connector as never })
+  await outgoing.start(peer, { id: 'job', workspacePath: h.directory, task: 'hello' })
+  const result = await outgoing.wait('job', 20)
+  assert.equal(result.remote?.status, 'running')
+  assert.equal(result.remote?.text, 'partial')
+  assert.equal(result.submission, 'accepted')
+  assert.equal(result.cancelRequested, undefined)
+  assert.equal(cancels, 0)
+  remote.status = 'completed'
+  remote.text = 'finished after the wait'
+  remote.updatedAt = new Date().toISOString()
+  assert.equal((await outgoing.refresh('job')).remote?.text, 'finished after the wait')
+  assert.equal(outgoing.get('job').remote?.status, 'completed')
+  assert.equal(cancels, 0)
 })

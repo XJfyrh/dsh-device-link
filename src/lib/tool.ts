@@ -1,5 +1,5 @@
 import type { LoadRuntime } from '../index.js'
-import { service, type HostContext } from './host.js'
+import type { HostContext } from './host.js'
 import type { PeerView } from './connect.js'
 import { createHash, randomUUID } from 'node:crypto'
 
@@ -10,7 +10,7 @@ const output = {
   },
 }
 
-export function registerDeviceTools(ctx: HostContext, { load, enabled = true }: { load: LoadRuntime; enabled?: boolean }): () => void {
+export function registerDeviceTools(ctx: Pick<HostContext, 'get'>, { load, enabled = true }: { load: LoadRuntime; enabled?: boolean }): () => void {
   if (!enabled) return () => {}
   const disposers: (() => void)[] = []
   let devices: PeerView[] = []
@@ -22,7 +22,7 @@ export function registerDeviceTools(ctx: HostContext, { load, enabled = true }: 
       if (!stopped) devices = next
     }).catch(error => console.warn('[device-link] sync', error)).finally(() => { refreshing = undefined })
   }
-  const tools = service(ctx, 'tools')
+  const tools = ctx.get('tools')
   if (tools) {
     disposers.push(tools.register({
       name: 'device_delegate', description: '在 @ 引用指定的设备工作区执行任务。模型、终端、浏览器和文件工具由执行设备管理。',
@@ -69,7 +69,7 @@ export function registerDeviceTools(ctx: HostContext, { load, enabled = true }: 
       },
     }))
   }
-  const prompt = service(ctx, 'systemPrompt')
+  const prompt = ctx.get('systemPrompt')
   if (prompt) disposers.push(prompt.section({ name: 'device-link', order: 420, text: () => [
     '## 跨设备协作',
     'device:// 引用标明设备 id 和工作区路径。用户要求在该工作区执行操作时，用 device_delegate 委派完整任务。引用会话用于讨论或分析时，在本地回答。',

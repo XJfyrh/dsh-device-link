@@ -2,7 +2,6 @@ import type * as ReactTypes from 'react'
 import type { ClientPrimitives, CreatePortal } from './contracts.js'
 import type { ExecutionContext, ModelSelection } from '../lib/types.js'
 
-/** The native model menu's root/model/effort interaction, backed by a remote draft. */
 export function createModelPicker(React: typeof ReactTypes, primitives: ClientPrimitives, createPortal: CreatePortal) {
   const { useState, useEffect, useLayoutEffect, useRef, useId } = React
   const { MenuSurface, MenuGroup, IconChevronDownOutlineRegular: Down, IconChevronRightOutlineRegular: Right, IconCheckOutlineRegular: Check } = primitives

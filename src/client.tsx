@@ -11,7 +11,7 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
   const { createPortal } = require('react-dom')
   return { inject: ['slots', 'inputTriggers', 'sidebarRightTabs', 'sidebarRight', 'layout', 'sessions', 'conversation', 'uiWorkspace', 'uiConversation'], apply(ctx) {
     const state = createClientState(ctx)
-    const components = createComponents(React, ctx, state, primitives, createPortal)
+    const components = createComponents(React, state, primitives, createPortal)
     ctx.effect(() => {
       const style = document.createElement('style')
       style.dataset.plugin = 'dsh-device-link'; style.textContent = styles; document.head.appendChild(style)

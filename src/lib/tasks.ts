@@ -1,7 +1,7 @@
 import crypto from 'node:crypto'
 import { isPathAllowed } from './scope.js'
 import { delegationEnd, delegationText } from './delegation.js'
-import { service, type HostContext } from './host.js'
+import type { HostContext } from './host.js'
 import { sameSelection } from './models.js'
 import {
   HttpError, errorMessage, record, type DelegateInput, type DelegateResult,
@@ -32,8 +32,8 @@ export async function createTaskManager({ store, ctx, run }: {
     let error = '执行跟进已中断，请查看设备会话确认状态'
     try {
       if (task.baselineSeq !== undefined) {
-        const live = service(ctx, 'sessions')?.get(task.sessionId)
-        const events = live?.snapshotEvents() ?? (await service(ctx, 'sessionQuery')?.readSession(task.sessionId))?.events ?? []
+        const live = ctx.get('sessions')?.get(task.sessionId)
+        const events = live?.snapshotEvents() ?? (await ctx.get('sessionQuery')?.readSession(task.sessionId))?.events ?? []
         const end = delegationEnd(events, task.baselineSeq, task.promptRequestId)
         if (end) {
           const reason = record(end.data.reason)
@@ -68,7 +68,7 @@ export async function createTaskManager({ store, ctx, run }: {
         || JSON.stringify(grant.scope) !== JSON.stringify(owner.scope)) throw new Error('任务开始前授权已变更')
       const result = await run({
         workspacePath: task.workspacePath, task: task.prompt, sessionId: task.sessionId,
-        resume: task.resume, requestId: task.promptRequestId, timeoutMs: Infinity, signal: controller.signal,
+        resume: task.resume, requestId: task.promptRequestId, signal: controller.signal,
         confineWorkspace: owner.scope.workspaces !== 'all',
         selection: task.selection,
         async onProgress(progress) {

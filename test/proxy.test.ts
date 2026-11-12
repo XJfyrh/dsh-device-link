@@ -1,10 +1,3 @@
-/**
- * Tests for the owner-credential exchange and the GUI reverse proxy.
- *
- * Everything listens on 127.0.0.1: a fake Harness GUI (token -> Set-Cookie, HTML, JSON, WebSocket
- * echo) and a local HTTP server that exposes lib/proxy.js. No external dependency, no real DSH.
- */
-
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
@@ -16,24 +9,24 @@ import { createGuiProxy } from '../src/lib/proxy.ts'
 const HOST = '127.0.0.1'
 const verbose = Boolean(process.env.DL_TEST_VERBOSE)
 const log = {
-  info: (...args) => verbose && console.log(...args),
-  warn: (...args) => verbose && console.warn(...args),
-  error: (...args) => verbose && console.error(...args),
+  info: (...args: unknown[]) => verbose && console.log(...args),
+  warn: (...args: unknown[]) => verbose && console.warn(...args),
+  error: (...args: unknown[]) => verbose && console.error(...args),
 }
 
-function listen(server) {
-  return new Promise((resolve, reject) => {
-    const onError = error => reject(error)
+function listen(server: http.Server) {
+  return new Promise<net.AddressInfo>((resolve, reject) => {
+    const onError = (error: Error) => reject(error)
     server.once('error', onError)
     server.listen(0, HOST, () => {
       server.off('error', onError)
-      resolve(server.address())
+      resolve(server.address() as net.AddressInfo)
     })
   })
 }
 
-function waitForClose(socket, timeoutMs = 3_000) {
-  return new Promise((resolve, reject) => {
+function waitForClose(socket: net.Socket, timeoutMs = 3_000) {
+  return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('socket did not close in time')), timeoutMs)
     socket.once('close', () => {
       clearTimeout(timer)
@@ -42,15 +35,15 @@ function waitForClose(socket, timeoutMs = 3_000) {
   })
 }
 
-function closeServer(server) {
-  server.closeAllConnections?.()
-  return new Promise(resolve => server.close(() => resolve()))
+function closeServer(server: http.Server) {
+  server.closeAllConnections()
+  return new Promise<void>(resolve => server.close(() => resolve()))
 }
 
-function httpRequest({ port, path, method = 'GET', headers = {}, body }) {
-  return new Promise((resolve, reject) => {
+function httpRequest({ port, path, method = 'GET', headers = {}, body }: { port: number; path: string; method?: string; headers?: http.OutgoingHttpHeaders; body?: string }) {
+  return new Promise<{ status: number | undefined; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
     const request = http.request({ host: HOST, port, path, method, headers, agent: false }, response => {
-      const chunks = []
+      const chunks: Buffer[] = []
       response.on('data', chunk => chunks.push(chunk))
       response.on('error', reject)
       response.on('end', () =>
@@ -69,16 +62,16 @@ function httpRequest({ port, path, method = 'GET', headers = {}, body }) {
 
 async function freePort() {
   const probe = net.createServer()
-  await new Promise(resolve => probe.listen(0, HOST, resolve))
-  const { port } = probe.address()
-  await new Promise(resolve => probe.close(resolve))
+  await new Promise<void>(resolve => probe.listen(0, HOST, resolve))
+  const { port } = probe.address() as net.AddressInfo
+  await new Promise<void>(resolve => probe.close(() => resolve()))
   return port
 }
 
 /** Reads socket bytes while multiple sequential predicates wait for their marker. */
-function createByteReader(socket) {
-  const chunks = []
-  const waiters = new Set()
+function createByteReader(socket: net.Socket) {
+  const chunks: Buffer[] = []
+  const waiters = new Set<{ check(): void }>()
   socket.on('data', chunk => {
     chunks.push(chunk)
     for (const waiter of [...waiters]) waiter.check()
@@ -87,10 +80,10 @@ function createByteReader(socket) {
     for (const waiter of [...waiters]) waiter.check()
   })
 
-  function waitFor(predicate, timeoutMs = 3_000) {
+  function waitFor<T>(predicate: (buffer: Buffer) => T | null | false, timeoutMs = 3_000): Promise<T> {
     return new Promise((resolve, reject) => {
       const waiter = {
-        timer: undefined,
+        timer: undefined as NodeJS.Timeout | undefined,
         check() {
           let result
           try {
@@ -123,7 +116,11 @@ function createByteReader(socket) {
 }
 
 function createFakeGui() {
-  const state = {
+  const state: {
+    token: string; issueSid: string; acceptedSid: string; exchanges: number;
+    hits: { method: string | undefined; url: string | undefined; headers: http.IncomingHttpHeaders }[];
+    upgrades: { url: string | undefined; headers: http.IncomingHttpHeaders }[];
+  } = {
     token: 'test-token-1',
     issueSid: 'abc',
     acceptedSid: 'abc',
@@ -133,10 +130,9 @@ function createFakeGui() {
   }
 
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url, 'http://gui.invalid')
+    const url = new URL(req.url!, 'http://gui.invalid')
     state.hits.push({ method: req.method, url: req.url, headers: req.headers })
 
-    // Token exchange: 302 + the owner session cookie.
     if (url.pathname === '/' && url.searchParams.has('token')) {
       if (url.searchParams.get('token') !== state.token) {
         res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
@@ -170,6 +166,8 @@ function createFakeGui() {
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'set-cookie': 'gui_page=1; Path=/',
+        connection: 'close, x-local-only',
+        'x-local-only': 'private hop value',
       })
       res.end('<!doctype html><title>fake GUI</title><h1>fake GUI</h1>')
       return
@@ -180,14 +178,14 @@ function createFakeGui() {
 
   server.on('upgrade', (req, socket, head) => {
     socket.on('error', () => {})
-    state.upgrades.push({ url: req.url, headers: req.headers, head: head?.toString('latin1') ?? '' })
+    state.upgrades.push({ url: req.url, headers: req.headers })
     const cookie = req.headers.cookie ?? ''
     const authorized = cookie.split(/;\s*/).includes(`sid=${state.acceptedSid}`)
     if (!authorized) {
-      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nSet-Cookie: sid=secret; Path=/\r\nContent-Length: 0\r\n\r\n')
       return
     }
-    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade, x-local-only\r\nSet-Cookie: sid=secret; Path=/\r\nx-local-only: private hop value\r\n\r\nserver-head-bytes')
     if (head?.length) socket.write(head)
     socket.on('data', chunk => socket.write(chunk))
     // A real WebSocket peer answers the client's FIN; the tunnel is a dumb pipe, so close here.
@@ -244,12 +242,13 @@ test('owner credentials + GUI proxy', async t => {
     const response = await httpRequest({
       port: proxyPort,
       path: '/',
-      headers: { referer: `http://${HOST}:${proxyPort}/index.html` },
+      headers: { referer: `http://${HOST}:${proxyPort}/index.html`, connection: 'close, x-client-only', 'x-client-only': 'private client value' },
     })
     assert.equal(response.status, 200)
     assert.match(String(response.headers['content-type']), /text\/html/)
     assert.match(response.body, /fake GUI/)
     assert.equal(response.headers['set-cookie'], undefined, 'GUI Set-Cookie must stay host-side')
+    assert.equal(response.headers['x-local-only'], undefined)
 
     const hit = gui.state.hits.find(entry => entry.url === '/')
     assert.ok(hit, 'the GUI must have seen GET /')
@@ -257,6 +256,7 @@ test('owner credentials + GUI proxy', async t => {
     assert.equal(hit.headers.origin, guiOrigin)
     assert.equal(hit.headers.referer, `${guiOrigin}/index.html`)
     assert.equal(hit.headers.cookie, 'sid=abc')
+    assert.equal(hit.headers['x-client-only'], undefined)
   })
 
   await t.test('proxies JSON from /api/data', async () => {
@@ -289,7 +289,7 @@ test('owner credentials + GUI proxy', async t => {
     const socket = net.connect(proxyPort, HOST)
     socket.on('error', () => {})
     const reader = createByteReader(socket)
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       socket.once('connect', resolve)
       socket.once('error', reject)
     })
@@ -298,7 +298,8 @@ test('owner credentials + GUI proxy', async t => {
     const handshake = [
       'GET /api/mux HTTP/1.1',
       `Host: ${HOST}:${proxyPort}`,
-      'Connection: Upgrade',
+      'Connection: Upgrade, x-client-only',
+      'x-client-only: private client value',
       'Upgrade: websocket',
       'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
       'Sec-WebSocket-Version: 13',
@@ -316,11 +317,12 @@ test('owner credentials + GUI proxy', async t => {
       const end = text.indexOf('\r\n\r\n')
       if (end === -1) return null
       const headerEnd = end + 4
-      if (buffer.length < headerEnd + head.length) return null
+      if (buffer.length < headerEnd + 'server-head-bytes'.length + head.length) return null
       return { header: text.slice(0, headerEnd), body: text.slice(headerEnd) }
     })
     assert.match(first.header, /^HTTP\/1\.1 101/)
-    assert.equal(first.body, 'first-head-bytes')
+    assert.doesNotMatch(first.header, /set-cookie|sid=secret|x-local-only/i)
+    assert.equal(first.body, 'server-head-bytesfirst-head-bytes')
 
     socket.write('second-round')
     await reader.waitFor(buffer => buffer.toString('latin1').includes('second-round'))
@@ -334,7 +336,7 @@ test('owner credentials + GUI proxy', async t => {
     assert.equal(upgrade.headers.cookie, 'sid=def')
     assert.equal(upgrade.headers.connection, 'Upgrade')
     assert.equal(upgrade.headers.upgrade, 'websocket')
-    assert.equal(upgrade.head, 'first-head-bytes')
+    assert.equal(upgrade.headers['x-client-only'], undefined)
 
     const closed = waitForClose(socket)
     socket.end()
@@ -361,6 +363,18 @@ test('owner credentials + GUI proxy', async t => {
       postsBefore + 1,
       'exactly one upstream attempt',
     )
+  })
+
+  await t.test('failed upgrades also strip owner cookies before closing the connection', async () => {
+    const socket = net.connect(proxyPort, HOST)
+    socket.on('error', () => {})
+    const reader = createByteReader(socket)
+    const closed = waitForClose(socket)
+    socket.write(`GET /api/mux HTTP/1.1\r\nHost: ${HOST}:${proxyPort}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`)
+    const response = await reader.waitFor(buffer => buffer.toString().includes('\r\n\r\n') ? buffer.toString() : null)
+    assert.match(response, /^HTTP\/1\.1 401/)
+    assert.doesNotMatch(response, /set-cookie|sid=secret/i)
+    await closed
   })
 
   await t.test('throws a clear error when the GUI origin is unavailable', async () => {
@@ -393,7 +407,7 @@ test('owner credentials + GUI proxy', async t => {
   })
 })
 
-test('owner credentials accept a bare token and reject a bad token', async t => {
+test('owner credentials require the authenticated GUI URL', async t => {
   const gui = createFakeGui()
   const guiAddress = await listen(gui.server)
   const guiOrigin = `http://${HOST}:${guiAddress.port}`
@@ -416,22 +430,45 @@ test('owner credentials accept a bare token and reject a bad token', async t => 
     assert.equal(gui.state.exchanges, 1, 'one in-flight exchange shared by all callers')
   })
 
-  await t.test('bare token from getAuthenticatedUrl', async () => {
-    const credentials = createOwnerCredentials({
-      origin: guiOrigin,
-      getAuthenticatedUrl: () => gui.state.token,
-      log,
-    })
-    assert.equal(await credentials.getCookie(), 'sid=abc')
-    assert.equal(gui.state.hits.at(-1).url, `/?token=${gui.state.token}`)
+  await t.test('rejects bare tokens, relative URLs, missing tokens and foreign origins before fetching', async () => {
+    const before = gui.state.hits.length
+    for (const url of [gui.state.token, '/?token=x', guiOrigin, 'http://192.168.1.2/?token=x']) {
+      const credentials = createOwnerCredentials({ origin: guiOrigin, getAuthenticatedUrl: () => url,
+        fetchImpl: async () => { assert.fail('invalid authentication URL must not be fetched') }, log })
+      await assert.rejects(credentials.getCookie(), /URL|token/i)
+    }
+    assert.equal(gui.state.hits.length, before)
   })
 
   await t.test('bad token surfaces the HTTP status', async () => {
     const credentials = createOwnerCredentials({
       origin: guiOrigin,
-      getAuthenticatedUrl: () => 'wrong-token',
+      getAuthenticatedUrl: () => `${guiOrigin}/?token=wrong-token`,
       log,
     })
     await assert.rejects(credentials.getCookie(), /HTTP 401/)
   })
+})
+
+test('an invalidated in-flight cookie exchange cannot replace a newer cached cookie', async () => {
+  let releaseFirst!: (response: Response) => void
+  const firstResponse = new Promise<Response>(resolve => { releaseFirst = resolve })
+  let firstStarted!: () => void
+  const started = new Promise<void>(resolve => { firstStarted = resolve })
+  let exchanges = 0
+  const credentials = createOwnerCredentials({
+    origin: 'http://127.0.0.1:47655', getAuthenticatedUrl: () => 'http://127.0.0.1:47655/?token=owner',
+    fetchImpl: async () => {
+      if (++exchanges === 1) { firstStarted(); return firstResponse }
+      return new Response(null, { status: 302, headers: { 'set-cookie': 'sid=new; Path=/' } })
+    },
+  })
+  const oldRead = credentials.getCookie()
+  await started
+  credentials.invalidate()
+  assert.equal(await credentials.getCookie(), 'sid=new')
+  releaseFirst(new Response(null, { status: 302, headers: { 'set-cookie': 'sid=old; Path=/' } }))
+  assert.equal(await oldRead, 'sid=old')
+  assert.equal(await credentials.getCookie(), 'sid=new')
+  assert.equal(exchanges, 2)
 })

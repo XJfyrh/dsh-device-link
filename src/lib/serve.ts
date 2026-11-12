@@ -9,7 +9,7 @@ import { authorizedWorkspace, defaultScope, normalizeScope, sessionAllowed, isPa
 import type { createTaskManager } from './tasks.js'
 import { parseSelection } from './models.js'
 import type { ExecutionContext } from './types.js'
-import { API_VERSION, APP_VERSION, HttpError, errorMessage, type Store, type Scope, type Logger, type PairingGrant, type HostFacts, type SessionContent, type DelegateInput, type DelegateResult, type TrustedDevice } from './types.js'
+import { API_VERSION, APP_VERSION, HttpError, errorMessage, type Store, type Scope, type Logger, type PairingGrant, type HostFacts, type SessionContent, type TrustedDevice } from './types.js'
 
 export interface GuiProxy {
   handle(req: IncomingMessage, res: ServerResponse): Promise<void> | void
@@ -23,20 +23,18 @@ interface ServerDependencies {
   proxy: GuiProxy
   factsProvider?: (scope: Scope) => Promise<HostFacts>
   sessionProvider?: (id: string, scope: Scope) => Promise<SessionContent>
-  delegateProvider?: (input: DelegateInput) => Promise<DelegateResult>
   taskManager?: Awaited<ReturnType<typeof createTaskManager>>
   executionProvider?: (workspace: string, sessionId?: string) => Promise<ExecutionContext>
   log?: Logger
 }
 
-export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, delegateProvider, taskManager, executionProvider, log = console }: ServerDependencies) {
+export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, taskManager, executionProvider, log = console }: ServerDependencies) {
   let listen: { host: string; port: number } | null = null
   let activePairing: (PairingGrant & { code: string; expiresAt: string }) | null = null
   const accessCodes = new Map<string, { token: string; deviceId: string; expiresAt: number }>()
   const failures = new Map<string, { count: number; resetAt: number }>()
   const sockets = new Set<Duplex>()
   const authorizedSockets = new Map<Duplex, Set<string>>()
-  const tasks = new Map<string, Set<AbortController>>()
   const incomingAllowed = () => config.allowIncoming !== false && store.state().serve.allowIncoming
 
   function authenticate(req: IncomingMessage): { entry: TrustedDevice; token: string } {
@@ -69,7 +67,6 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
   async function closeDevice(deviceId: string): Promise<void> {
     for (const [socket, ids] of authorizedSockets) if (ids.has(deviceId)) socket.destroy()
     for (const [code, access] of accessCodes) if (access.deviceId === deviceId) accessCodes.delete(code)
-    for (const controller of tasks.get(deviceId) ?? []) controller.abort(new Error('device authorization changed'))
     await taskManager?.cancelOwner(deviceId)
   }
   async function collect(entry: TrustedDevice): Promise<HostFacts> {
@@ -147,10 +144,6 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       sendJson(res, 200, { ok: true, api: API_VERSION, device: { ...store.state().identity, app: 'dsh-device-link', version: APP_VERSION }, scope: entry.scope, host })
       return
     }
-    if (req.method === 'GET' && route === '/dl/sessions') {
-      sendJson(res, 200, { ok: true, sessions: (await collect(entry)).sessions })
-      return
-    }
     if (req.method === 'GET' && route === '/dl/session') {
       if (!sessionProvider) throw new HttpError(503, 'session content unavailable')
       const content = await sessionProvider(url.searchParams.get('id') ?? '', entry.scope)
@@ -167,31 +160,6 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       const expiresAt = Date.now() + (config.accessTtlMs ?? 60_000)
       accessCodes.set(ac, { deviceId: entry.deviceId, token, expiresAt })
       sendJson(res, 200, { ok: true, url: `${origin()}/dl/enter?ac=${ac}`, expiresAt: new Date(expiresAt).toISOString() })
-      return
-    }
-    if (req.method === 'POST' && route === '/dl/delegate') {
-      if (!entry.scope.allowDelegate) throw new HttpError(403, 'delegation disabled', 'scope')
-      if (!delegateProvider) throw new HttpError(503, 'delegation unavailable')
-      const body = await readJson(req)
-      if (typeof body.workspacePath !== 'string' || typeof body.task !== 'string' || !body.task.trim()) throw new HttpError(400, 'workspacePath and task required')
-      const workspacePath = await authorizedWorkspace(body.workspacePath, entry.scope)
-      await collect(entry)
-      const controller = new AbortController()
-      const active = tasks.get(entry.deviceId) ?? new Set<AbortController>()
-      if (active.size >= 4) throw new HttpError(429, 'device already has four running tasks')
-      active.add(controller)
-      tasks.set(entry.deviceId, active)
-      const onClose = () => { if (!res.writableEnded) controller.abort(new Error('caller disconnected')) }
-      res.once('close', onClose)
-      try {
-        const timeoutMs = Math.min(600_000, Math.max(1000, Number(body.timeoutMs) || 300_000))
-        const result = await delegateProvider({ workspacePath, task: body.task, timeoutMs, signal: controller.signal, confineWorkspace: entry.scope.workspaces !== 'all' })
-        sendJson(res, 200, { ok: true, ...result })
-      } finally {
-        active.delete(controller)
-        if (!active.size) tasks.delete(entry.deviceId)
-        res.off('close', onClose)
-      }
       return
     }
     if ((route === '/dl/tasks' || route === '/dl/execution') && req.method === 'POST') {

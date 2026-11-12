@@ -7,6 +7,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import type { Duplex } from 'node:stream'
 import { openStore } from '../src/lib/store.ts'
 import { createPairing } from '../src/lib/pairing.ts'
 import { createOwnerCredentials } from '../src/lib/credentials.ts'
@@ -19,9 +20,9 @@ const silentLog = { info() {}, warn() {}, error() {} }
 /** Stand-in for the DSH web GUI: token exchange -> owner cookie -> page + JSON + websocket echo. */
 async function startFakeGui() {
   /** `closeAllConnections()` does not cover upgraded sockets: the server detaches them. */
-  const upgradeSockets = new Set()
+  const upgradeSockets = new Set<Duplex>()
   const server = http.createServer((req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1')
+    const url = new URL(req.url!, 'http://127.0.0.1')
     const cookie = String(req.headers.cookie ?? '')
     if (url.pathname === '/' && url.searchParams.has('token')) {
       res.writeHead(302, { location: '/', 'set-cookie': ['sid=owner-1; Path=/; HttpOnly; SameSite=Strict'] })
@@ -53,22 +54,22 @@ async function startFakeGui() {
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
     socket.write(`ECHO:cookie=${String(req.headers.cookie ?? '')}\r\n`)
   })
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  const { port } = server.address()
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address() as net.AddressInfo
   return {
     origin: `http://127.0.0.1:${port}`,
     async close() {
       for (const socket of upgradeSockets) socket.destroy()
       upgradeSockets.clear()
-      server.closeAllConnections?.()
-      await new Promise(resolve => server.close(() => resolve()))
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
     },
   }
 }
 
-async function startInstance({ home, name, guiOrigin }) {
+async function startInstance({ home, name, guiOrigin }: { home: string; name: string; guiOrigin: string }) {
   const store = await openStore({ home, deviceName: name, log: silentLog })
-  const pairing = createPairing({ open: false, ttlMs: 120_000 })
+  const pairing = createPairing({ ttlMs: 120_000 })
   const credentials = createOwnerCredentials({
     origin: guiOrigin,
     getAuthenticatedUrl: async () => `${guiOrigin}/?token=launch-token`,
@@ -84,17 +85,14 @@ async function startInstance({ home, name, guiOrigin }) {
     config: {
       port: 0,
       bindAddress: '127.0.0.1',
-      deviceName: name,
       allowIncoming: true,
       accessTtlMs: 60_000,
       maxPairFailures: 8,
       failureWindowMs: 600_000,
-      guiOrigin,
     },
     store,
     pairing,
     factsProvider: () => collectHostFacts({ get: () => undefined }),
-    credentials,
     proxy,
     log: silentLog,
   })
@@ -102,8 +100,8 @@ async function startInstance({ home, name, guiOrigin }) {
   return { store, server, listen, base: `http://127.0.0.1:${listen.port}` }
 }
 
-function upgradeEcho(host, port, cookie) {
-  return new Promise((resolve, reject) => {
+function upgradeEcho(host: string, port: number, cookie: string) {
+  return new Promise<string>((resolve, reject) => {
     const socket = net.connect({ host, port })
     let buffer = ''
     const timer = setTimeout(() => {
@@ -154,21 +152,18 @@ test('pair over the LAN listener, open the remote GUI, revoke', async t => {
     await fs.rm(root, { recursive: true, force: true })
   })
 
-  // 1. A opens pairing; the code is 8 digits.
   const opened = instanceA.server.openPairing({ relationship: 'same-account', scope: defaultScope('same-account') })
   assert.match(opened.code, /^\d{8}$/)
   assert.ok(instanceA.server.info().pairingOpen)
 
-  // 2. B pairs with A using address + code.
   const connectorB = createConnector({ store: instanceB.store, log: silentLog })
   const peerA = await connectorB.claim(instanceA.base, opened.code)
   assert.equal(peerA.name, 'machine-a')
   assert.ok(peerA.token.length > 20)
-  const probe = await connectorB.probe(peerA)
-  assert.equal(probe.ok, true)
+  const view = await connectorB.sync(peerA)
+  assert.equal(view.online, true)
   assert.equal(instanceA.server.trusted().length, 1)
 
-  // 3. B asks A for a one-time entry URL, then redeems it for a session cookie.
   const { url } = await connectorB.access(peerA)
   assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/dl\/enter\?ac=/)
   const enter = await fetch(url, { redirect: 'manual' })
@@ -177,11 +172,9 @@ test('pair over the LAN listener, open the remote GUI, revoke', async t => {
   assert.match(setCookie, /dl_session=/)
   const sessionCookie = setCookie.split(';')[0]
 
-  // 4. The same one-time code is dead on reuse.
   const reuse = await fetch(url, { redirect: 'manual' })
   assert.equal(reuse.status, 401)
 
-  // 5. Through the session cookie: HTML from the remote GUI, JSON, and a websocket tunnel.
   const page = await fetch(`${instanceA.base}/`, { headers: { cookie: sessionCookie } })
   assert.equal(page.status, 200)
   assert.match(await page.text(), /fake remote gui/)
@@ -198,31 +191,10 @@ test('pair over the LAN listener, open the remote GUI, revoke', async t => {
   assert.match(upgrade, /101 Switching Protocols/)
   assert.match(upgrade, /ECHO:cookie=.*sid=owner-1/)
 
-  // 6. Revoke from the connecting side drops the peer and the trusted grant.
   await connectorB.revoke(peerA)
   assert.equal(instanceA.server.trusted().length, 0)
   const afterRevoke = await fetch(`${instanceA.base}/dl/info`)
   assert.equal(afterRevoke.status, 200)
   const denied = await fetch(`${instanceA.base}/`, { headers: { cookie: sessionCookie } })
   assert.equal(denied.status, 401)
-})
-
-test('wrong pairing code is rejected and rate limited', async t => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dsh-device-link-'))
-  const gui = await startFakeGui()
-  const instance = await startInstance({ home: path.join(root, 'a'), name: 'machine-a', guiOrigin: gui.origin })
-  t.after(async () => {
-    await instance.server.stop()
-    await gui.close()
-    await fs.rm(root, { recursive: true, force: true })
-  })
-  const opened = instance.server.openPairing({ relationship: 'same-account', scope: defaultScope('same-account') })
-  const wrong = opened.code === '00000000' ? '11111111' : '00000000'
-  const response = await fetch(`${instance.base}/dl/pair/claim`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code: wrong, deviceId: 'x', name: 'x' }),
-  })
-  assert.equal(response.status, 403)
-  assert.equal(instance.server.trusted().length, 0)
 })

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import { executionContext, selectForTask } from '../src/lib/models.ts'
+import { executionContext, selectForTask, eventSelection } from '../src/lib/models.ts'
 import { collectHostFacts, eventMessages } from '../src/lib/host-facts.ts'
 import { conversationTurns } from '../src/client/conversation.ts'
 import type { HostAgent, HostContext, HostEvent, HostServices } from '../src/lib/host.ts'
@@ -13,11 +13,11 @@ const catalog = {default:defaultModel,groups:[{id:'p',name:'Provider',models:[{i
 function fixture() {
   const events: HostEvent[] = []
   let selected: ModelSelection = defaultModel
-  const agent: HostAgent = {id:'s',status:'idle',options:defaultModel,session:{id:'s',header:{id:'s',cwd:root},seq:0,snapshotEvents:()=>events,deriveMessages:()=>[]}}
+  const agent: HostAgent = {id:'s',status:'idle',options:defaultModel,session:{id:'s',header:{id:'s',cwd:root},seq:0,snapshotEvents:()=>events}}
   const services: Partial<HostServices> = {
     agents:{get:()=>agent,list:()=>[agent]},sessions:{get:()=>agent.session,list:()=>[agent.session]},
     agentDefaultModel:{currentSelection:()=>defaultModel},llm:{resolveCallConfig:async input=>input},
-    sessionController:{create:async()=>({sessionId:'s'}),prompt:async()=>{},cancel:async()=>{},modelCatalog:async()=>catalog,
+    sessionController:{create:async()=>({sessionId:'s'}),resolveAgent:async()=>({agent}),prompt:async()=>{},cancel:async()=>{},modelCatalog:async()=>catalog,
       agents:{selectionFor:()=>({current:selected}),selectForNextRequest:(_agent,value)=>{selected=value},serializeImageAdmission:async(_agent,operation)=>operation()}},
   }
   return {agent,events,ctx:{get:name=>services[name]} as Pick<HostContext,'get'>}
@@ -32,6 +32,16 @@ test('session model selection is validated and does not change device defaults',
   f.agent.status='running'
   await assert.rejects(()=>selectForTask(f.ctx,f.agent,chosen),/正在执行/)
   await assert.rejects(()=>executionContext(f.ctx,path.resolve('different'),'s'),/不属于/)
+})
+
+test('archived selection separates adapter defaults from explicit next-prompt choices', () => {
+  const header: HostEvent = { seq: 1, type: 'request/header', data: { header: { config: chosen, adapterDefaults: { reasoningEffort: true } } } }
+  assert.deepEqual(eventSelection([header]), { provider: chosen.provider, model: chosen.model })
+  assert.deepEqual(eventSelection([{ ...header, data: { header: { config: chosen } } }]), chosen)
+  const pending: HostEvent = { seq: 2, type: 'model/selection', data: chosen }
+  assert.deepEqual(eventSelection([header, pending]), chosen)
+  assert.deepEqual(eventSelection([pending, { ...header, seq: 3 }]), { provider: chosen.provider, model: chosen.model })
+  assert.deepEqual(eventSelection([pending, { seq: 3, type: 'request/header', data: { header: { config: defaultModel } } }]), chosen)
 })
 test('durable titles and request identities survive history projection',async()=>{
   const f=fixture()

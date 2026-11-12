@@ -1,12 +1,12 @@
 import type * as ReactTypes from 'react'
-import type { ClientContext, ClientPrimitives, CreatePortal } from './contracts.js'
+import type { ClientPrimitives, CreatePortal } from './contracts.js'
 import { api, active, draftKey, message, type ClientState, type Resource, type SessionSnapshot } from './state.js'
-import type { ExecutionContext, ModelSelection, OutgoingTask } from '../lib/types.js'
+import type { ExecutionContext, OutgoingTask } from '../lib/types.js'
 import { relativeTime, shortText, workspaceName } from '../lib/presentation.js'
 import { conversationTurns, statusLabels } from './conversation.js'
 import { createModelPicker } from './model-picker.js'
 
-export function createTaskComponents(React: typeof ReactTypes, ctx: ClientContext, state: ClientState, Markdown: ReactTypes.ComponentType<{ text: string }>, primitives: ClientPrimitives, createPortal: CreatePortal) {
+export function createTaskComponents(React: typeof ReactTypes, state: ClientState, Markdown: ReactTypes.ComponentType<{ text: string }>, primitives: ClientPrimitives, createPortal: CreatePortal) {
   const { useState, useEffect, useRef, useSyncExternalStore } = React
   const { IconCopyOutlineRegular: CopyIcon, IconCheckOutlineRegular: CheckIcon, IconChevronRightOutlineRegular: ChevronIcon, IconFolderCloseRegular: FolderIcon } = primitives
   const useView = () => useSyncExternalStore(state.subscribe, state.getSnapshot)
@@ -88,8 +88,7 @@ export function createTaskComponents(React: typeof ReactTypes, ctx: ClientContex
         .finally(() => { if (!controller.signal.aborted) setLoading(false) })
       return () => controller.abort()
     }, [sessionId, peer?.online, hasContent, terminalRevision, refresh])
-    const legacyHistory = !!snapshot?.session.messages.some(message => message.seq === undefined) && !!tasks.length
-    const turns = conversationTurns(tasks, legacyHistory ? null : snapshot)
+    const turns = conversationTurns(tasks, snapshot)
     const latestTask = tasks[0]
     const selection = draft.selection ?? context?.selected
     const validModel = !!context?.catalog.groups.some(group => group.id === selection?.provider && group.models.some(model => model.id === selection.model
@@ -112,7 +111,7 @@ export function createTaskComponents(React: typeof ReactTypes, ctx: ClientContex
         const element = container.querySelector<HTMLElement>(`[data-turn-task="${resource.taskId}"]`)
         if (element) { container.scrollTop = element.offsetTop - container.offsetTop - 16; anchored.current = resource.taskId; stick.current = false }
       } else if (stick.current) container.scrollTop = container.scrollHeight
-    }, [terminalRevision, snapshot, tasks.map(task => task.remote?.text.length ?? 0).join('|')])
+    }, [resource.taskId, terminalRevision, snapshot, tasks.map(task => task.remote?.text.length ?? 0).join('|')])
     async function submit() {
       if (!resource.workspace || !draft.text.trim() || sending || busy || !peer?.online || !canDelegate || !selection || !validModel) return
       setSending(true); setError('')
@@ -159,7 +158,6 @@ export function createTaskComponents(React: typeof ReactTypes, ctx: ClientContex
           {!peer?.online && <p className="dl-notice">设备离线，已收到的内容仍可阅读。恢复连接后可继续发送。</p>}
           {sessionId && !hasContent && <p className="dl-notice">会话正文未获同步授权，这里显示从本机委派的任务和返回结果。</p>}
           {snapshot?.session.truncated && <p className="dl-notice">较早的会话内容已截断。</p>}
-          {legacyHistory && <p className="dl-notice">历史缓存需要联网更新后才能合并到任务。<button onClick={() => state.preview({ ...resource, snapshot: snapshot! })}>查看已有缓存</button></p>}
           {historyError && <p className="dl-notice">{historyError} <button onClick={() => setRefresh(value => value + 1)}>重新读取</button></p>}
           {loading && !turns.length && <p className="muted" role="status">正在读取会话…</p>}
           {!turns.length && !loading && !historyError && <div className="dl-start"><h2>{sessionId ? hasContent ? '会话还没有消息' : '尚无本机任务结果' : `在 ${workspaceName(resource.workspace)} 中开始任务`}</h2><p className="muted">{sessionId ? hasContent ? '在下方输入，继续这段对话。' : '查看完整历史需要执行设备授权同步此会话正文。' : `描述要完成的工作，任务将在 ${peer?.name ?? '此设备'} 上执行。`}</p></div>}

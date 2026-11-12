@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { registerDeviceTools } from '../src/lib/tool.ts'
-import type { ToolDefinition } from '../src/lib/host.ts'
+import type { HostContext, HostServices, ToolDefinition } from '../src/lib/host.ts'
 
 test('device tools return lossless JSON when optional result and cache fields are absent', async () => {
   const registered = new Map<string, ToolDefinition>()
@@ -11,7 +11,9 @@ test('device tools return lossless JSON when optional result and cache fields ar
     connector: { peerByRef: () => ({ name: 'remote', deviceId: 'remote' }) },
     outgoingTasks: { start: async () => task, wait: async () => task, refresh: async () => task, cancel: async () => task },
   }
-  const dispose = registerDeviceTools({ get: name => name === 'tools' ? { register(definition) { registered.set(definition.name, definition); return () => {} } } : undefined } as never, { load: async () => runtime as never })
+  const services: Partial<HostServices> = { tools: { register(definition) { registered.set(definition.name, definition); return () => {} } } }
+  const ctx: Pick<HostContext, 'get'> = { get: name => services[name] }
+  const dispose = registerDeviceTools(ctx, { load: async () => runtime as never })
   try {
     for (const [name, args] of [
       ['device_delegate', { device: 'remote', workspace: '/workspace', task: 'hello' }],

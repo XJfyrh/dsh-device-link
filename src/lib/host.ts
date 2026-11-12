@@ -10,7 +10,6 @@ export interface HostSession {
   updatedAt?: number
   seq: number
   snapshotEvents(from?: number, to?: number): HostEvent[]
-  deriveMessages(): HostMessage[]
 }
 export interface HostAgent {
   id: string
@@ -36,9 +35,9 @@ export interface HostServices {
   permissionPresets: { set(session: HostSession, preset: string): void }
   sandboxPolicy: { resolve(request: { session: HostSession }): { mode: string; workspaceRoot: string } }
   sessionController: {
-    modelCatalog?(): Promise<ModelCatalog>
-    /** Harness 0.2.1 session-scoped admission; public selectModel also saves a device default. */
-    agents?: {
+    modelCatalog(): Promise<ModelCatalog>
+    /** Public selectModel also changes the device default; delegated choices are session-local. */
+    agents: {
       selectionFor(agent: HostAgent): { current: ModelSelection }
       selectForNextRequest(agent: HostAgent, selection: ModelSelection): void
       serializeImageAdmission<T>(agent: HostAgent, operation: () => Promise<T>): Promise<T>
@@ -46,7 +45,7 @@ export interface HostServices {
     create(request: { sessionId: string; cwd: string }): Promise<{ sessionId: string }>
     prompt(request: { requestId: string; sessionId: string; mode: 'queue'; content: { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>
     cancel(request: { sessionId: string }): Promise<unknown>
-    resolveAgent?(sessionId: string): Promise<{ agent?: HostAgent; error?: { message?: string } }>
+    resolveAgent(sessionId: string): Promise<{ agent?: HostAgent; error?: { message?: string } }>
   }
   llm: { resolveCallConfig(selection: ModelSelection): Promise<ModelSelection> }
   sessionQuery: {
@@ -70,8 +69,4 @@ export interface HostContext {
   commands: {
     register(command: { name: string; description: string; input: { hint: string }; handler(invocation: { rawInput: string }): Promise<{ kind: string; text: string }> }): () => void
   }
-}
-
-export function service<K extends keyof HostServices>(ctx: Pick<HostContext, 'get'>, name: K): HostServices[K] | undefined {
-  try { return ctx.get(name) } catch { return undefined }
 }

@@ -3,8 +3,8 @@
  *
  * A pairing code is 8 digits, short lived, single use, and burns out after
  * `maxAttempts` wrong guesses from the same client key (the caller's IP).
- * Device tokens are 32 random bytes, stored only as sha256 hex, and compared
- * in constant time.
+ * Device tokens are 32 random bytes. The receiving device stores their SHA-256
+ * hashes; the connecting device stores the tokens to authenticate later requests.
  */
 
 import crypto from 'node:crypto'
@@ -26,37 +26,30 @@ function expiresAtIso(milliseconds: number) {
   return new Date(milliseconds).toISOString()
 }
 
-/** sha256 hex of a device token. Non-string/empty input hashes to '' (never verifies). */
 export function hashToken(token: unknown) {
   if (typeof token !== 'string' || token.length === 0) return ''
   return crypto.createHash('sha256').update(token, 'utf8').digest('hex')
 }
 
-/** Mint a device token and its stored hash. */
 export function createDeviceToken() {
   const token = crypto.randomBytes(32).toString('base64url')
   const tokenHash = hashToken(token)
-  return { token, tokenHash, hash: hashToken }
+  return { token, tokenHash }
 }
 
-/** Constant-time verify of a raw token against a stored sha256 hex hash. */
 export function verifyToken(token: unknown, tokenHash: unknown) {
   if (typeof token !== 'string' || token.length === 0) return false
   if (typeof tokenHash !== 'string' || tokenHash.length === 0) return false
-  return constantTimeEqual(hashToken(token), tokenHash.toLowerCase())
+  return constantTimeEqual(hashToken(token), tokenHash)
 }
 
-/**
- * @param {{ open?: boolean, ttlMs?: number, maxAttempts?: number }} [options]
- */
-export function createPairing({ open = false, ttlMs = DEFAULT_TTL_MS, maxAttempts = DEFAULT_MAX_ATTEMPTS } = {}) {
+export function createPairing({ ttlMs = DEFAULT_TTL_MS, maxAttempts = DEFAULT_MAX_ATTEMPTS } = {}) {
   const ttl = Number.isInteger(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TTL_MS
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : DEFAULT_MAX_ATTEMPTS
 
   let code: string | null = null
   let expiresAtMs = 0
   let enabled = false
-  /** @type {Map<string, number>} failed attempts per client key; cleared on every new code */
   const attempts = new Map<string, number>()
 
   function newCode() {
@@ -71,12 +64,9 @@ export function createPairing({ open = false, ttlMs = DEFAULT_TTL_MS, maxAttempt
     return { code, expiresAt: expiresAtIso(expiresAtMs) }
   }
 
-  if (open) openPairing()
-
   return {
     openPairing,
 
-    /** Forget the current code (used on shutdown / explicit close). */
     closePairing() {
       enabled = false
       code = null
@@ -91,8 +81,6 @@ export function createPairing({ open = false, ttlMs = DEFAULT_TTL_MS, maxAttempt
     /**
      * Verify and consume the code. One successful consume closes pairing.
      * `clientKey` scopes the failure counter (the caller passes the remote IP).
-     *
-     * @returns {{ ok: true } | { ok: false, reason: 'expired' | 'mismatch' | 'attempts' }}
      */
     consume(candidate: unknown, clientKey: string): { ok: true } | { ok: false; reason: 'expired' | 'mismatch' | 'attempts' } {
       const key = typeof clientKey === 'string' && clientKey ? clientKey : 'unknown'
@@ -114,7 +102,6 @@ export function createPairing({ open = false, ttlMs = DEFAULT_TTL_MS, maxAttempt
         return { ok: false, reason: 'mismatch' }
       }
 
-      // Single use: a successful claim closes the pairing immediately.
       enabled = false
       code = null
       expiresAtMs = 0

@@ -37,7 +37,6 @@ function asPositiveInt(value: unknown, fallback: number) {
   return Number.isInteger(number) && number > 0 ? number : fallback
 }
 
-/** Compose the effective plugin config from the patch row plus the documented env overrides. */
 export function resolveConfig(raw: Record<string, unknown> = {}) {
   const env = process.env
   const merged: Record<string, unknown> = { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) }
@@ -61,7 +60,6 @@ export function resolveConfig(raw: Record<string, unknown> = {}) {
   }
 }
 
-/** Local IPv4 interfaces that are worth advertising, best candidate first. */
 export function lanAddresses() {
   const candidates = []
   for (const [name, infos] of Object.entries(os.networkInterfaces())) {
@@ -80,18 +78,15 @@ function scoreAddress(name: string, address: string) {
   if (address.startsWith('192.168.')) score = 0
   else if (address.startsWith('10.')) score = 5
   else if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) score = 10
-  // Ranges that are almost never the LAN the other device sits on.
   if (/^192\.168\.56\./.test(address)) score += 60 // VirtualBox host-only default
-  // Adapter names that usually mean a virtual switch instead of the physical LAN.
   if (/vmware|virtualbox|vethernet|wsl|hyper-v|mihomo|clash|tailscale|docker|loopback/i.test(name)) score += 100
   if (/wi-?fi|wlan|wireless|802\.11/i.test(name)) score -= 20
   return score
 }
 
 /**
- * Resolve the listener address. `auto` picks the best LAN IPv4; an explicit value must be a local
- * IPv4 literal (or `127.0.0.1`, used by tests). `0.0.0.0` is refused on purpose, mirroring the
- * Harness web server: an unspecified bind exposes the proxy on every interface at once.
+ * Bind one private LAN interface, or loopback when no LAN interface is available.
+ * Wildcard binds would expose the GUI proxy on interfaces outside the selected LAN.
  */
 export function pickBindAddress(requested: string, available = lanAddresses()) {
   const wanted = (requested ?? DEFAULTS.bindAddress).trim()
@@ -108,10 +103,4 @@ export function pickBindAddress(requested: string, available = lanAddresses()) {
     throw new Error(`bindAddress ${wanted} is not one of this machine's IPv4 addresses (${[...local].join(', ')})`)
   }
   return { address: wanted, all: available, auto: false }
-}
-
-export function resolveDeviceName(config: { deviceName?: string }, fallbackName?: string) {
-  const configured = (config?.deviceName ?? '').trim()
-  if (configured) return configured
-  return (fallbackName ?? '').trim() || os.hostname() || 'dsh-device'
 }

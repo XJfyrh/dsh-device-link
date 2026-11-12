@@ -9,14 +9,16 @@ import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
 import { defaultScope } from '../src/lib/scope.js'
 import type { DeviceState } from '../src/lib/api.js'
-import type { DelegateResult, SessionContent, OutgoingTask, ExecutionContext } from '../src/lib/types.js'
+import type { DeviceTask, SessionContent, OutgoingTask, ExecutionContext } from '../src/lib/types.js'
+import { activeTask } from '../src/lib/tasks.js'
 import { chromium, expect, type Page } from '@playwright/test'
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const cli = process.env.DSH_CLI ?? path.join(process.env.LOCALAPPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'device-link-e2e-'))
 const children: ChildProcess[] = []
-const modelConfigured = Boolean(process.env.DEEPSEEK_API_KEY?.trim() || process.env.E2E_MODEL_HOME)
+const protocolOnly = process.argv.includes('--protocol-only')
+const modelConfigured = !protocolOnly && Boolean(process.env.DEEPSEEK_API_KEY?.trim() || process.env.E2E_MODEL_HOME)
 const report: { name: string; passed: boolean; durationMs: number; error?: string }[] = []
 let passed = 0
 let failed = 0
@@ -97,9 +99,17 @@ window.__ModuleLoader__.load({
       name: device-link-test-workspace
       config:
         path: ${JSON.stringify(workspacePath)}
+${protocolOnly ? `- id: llm-deepseek
+  config:
+    apiKeyEnv: DEVICE_LINK_E2E_NO_CREDENTIAL
+    baseURL: http://127.0.0.1:9
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+` : ''}
 `)
-  // Optional model credentials and settings are supplied by an explicit isolated template home.
-  if (process.env.E2E_MODEL_HOME) {
+  if (!protocolOnly && process.env.E2E_MODEL_HOME) {
     for (const file of ['.credentials.yaml', 'settings.json']) {
       await fs.copyFile(path.join(process.env.E2E_MODEL_HOME, file), path.join(home, file)).catch(error => {
         if (error.code !== 'ENOENT') throw error
@@ -107,7 +117,7 @@ window.__ModuleLoader__.load({
     }
   }
   const child = spawn(process.execPath, [cli, '--profile', 'test', '--port', '0', '--no-open'], {
-    cwd: project, env: { ...process.env, DSH_HOME: home, DSH_DEVICE_LINK_PORT: String(listenPort), DSH_DEVICE_LINK_BIND: '127.0.0.1' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: home, env: { ...process.env, ...(protocolOnly ? { DEEPSEEK_API_KEY: '', DEVICE_LINK_E2E_NO_CREDENTIAL: '' } : {}), DSH_HOME: home, DSH_DEVICE_LINK_PORT: String(listenPort), DSH_DEVICE_LINK_BIND: '127.0.0.1' }, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
   })
   children.push(child)
   let output = ''
@@ -141,6 +151,18 @@ async function api<T = Record<string, unknown>>(instance: Instance, route: strin
   const payload = JSON.parse(text) as T & { error?: string }
   if (!response.ok) throw new Error(`HTTP ${response.status} ${payload.error}`)
   return payload
+}
+async function runTask(instance: Instance, input: { deviceId: string; workspacePath: string; task: string }, timeoutMs: number): Promise<DeviceTask> {
+  const id = crypto.randomUUID()
+  let current = (await api<{ task: OutgoingTask }>(instance, 'task-start', { ...input, id })).task
+  const deadline = Date.now() + timeoutMs
+  while (!current.remote || activeTask(current.remote)) {
+    assert.notEqual(current.submission, 'failed', current.connectionError)
+    assert.ok(Date.now() < deadline, `task ${id} did not finish: ${current.remote?.status ?? current.submission}`)
+    await delay(300)
+    current = (await api<{ task: OutgoingTask }>(instance, 'task-refresh', { id })).task
+  }
+  return current.remote
 }
 async function step(name: string, operation: () => Promise<void>): Promise<void> {
   const started = Date.now()
@@ -200,7 +222,9 @@ try {
   const sa = await api<DeviceState>(a, 'state')
   const sb = await api<DeviceState>(b, 'state')
   assert.ok(sa.listen && sb.listen)
-  const lanA = `http://${sa.listen.host}:${sa.listen.port}`
+  const listenA = sa.listen
+  const listenB = sb.listen
+  const lanA = `http://${listenA.host}:${listenA.port}`
   let peerId = ''
   let cookie = ''
   let fileSessionId = ''
@@ -237,14 +261,16 @@ try {
     await websocket(lanA, cookie)
     assert.equal((await fetch(access.url, { redirect: 'manual' })).status, 401)
   })
-  await step('UI creation path admits delegation and exposes the remote session', async () => {
-    const result = await api<DelegateResult>(b, 'delegate', { deviceId: peerId, workspacePath: project, task: 'Reply with DEVICE_LINK_OK. Do not use tools.', timeoutMs: 30_000 })
+  await step('persistent task admission exposes a durable remote session and outcome', async () => {
+    const result = await runTask(b, { deviceId: peerId, workspacePath: project, task: 'Reply with DEVICE_LINK_OK. Do not use tools.' }, 30_000)
     assert.ok(result.sessionId.startsWith('delegate-'))
     if (modelConfigured) {
       assert.equal(result.status, 'completed', result.error)
       assert.match(result.text, /DEVICE_LINK_OK/)
     } else {
-      assert.ok(['completed', 'error', 'timeout'].includes(result.status))
+      assert.equal(result.status, 'error')
+      assert.ok(result.error, 'unconfigured model must report its failure')
+      if (protocolOnly) assert.match(result.error, /DEVICE_LINK_E2E_NO_CREDENTIAL/)
       console.log(`  model outcome ${result.status}${result.error ? ` (${result.error})` : ''}`)
     }
     const remote = await api<DeviceState>(a, 'state')
@@ -253,19 +279,21 @@ try {
   if (modelConfigured) {
     await step('scoped remote model reads a fixture and writes a file in its execution workspace', async () => {
       await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: { ...defaultScope('different-account'), workspaces: [executionWorkspace], allowDelegate: true, sessionSync: 'content' } })
-      const result = await api<DelegateResult>(b, 'delegate', {
+      const result = await runTask(b, {
         deviceId: peerId,
         workspacePath: executionWorkspace,
         task: '使用文件工具读取当前工作区的 input.txt，将其文本原样写入 result.txt。最后回复读取到的文本。',
-        timeoutMs: 120_000,
-      })
+      }, 120_000)
       assert.equal(result.status, 'completed', result.error)
       assert.equal((await fs.readFile(path.join(executionWorkspace, 'result.txt'), 'utf8')).trim(), marker)
       assert.ok(result.text.includes(marker), 'remote reply must include text read from the fixture')
       fileSessionId = result.sessionId
     })
     await step('remote grants reject a task outside the permitted workspace', async () => {
-      await assert.rejects(() => api(b, 'delegate', { deviceId: peerId, workspacePath: project, task: 'Reply blocked' }), /403/)
+      const { task } = await api<{ task: OutgoingTask }>(b, 'task-start', { id: crypto.randomUUID(), deviceId: peerId, workspacePath: project, task: 'Reply blocked' })
+      assert.equal(task.submission, 'failed')
+      assert.match(task.connectionError ?? '', /workspace/)
+      assert.equal(task.remote, undefined)
     })
     await step('remote transcript is synced and available through the local session endpoint', async () => {
       assert.ok(fileSessionId)
@@ -320,7 +348,8 @@ try {
           result.setDefaultTimeout(15_000)
           result.on('pageerror', error => errors.push(error.message))
           await result.goto(instance.base)
-          await result.getByRole('button', { name: '继续', exact: true }).click({ timeout: 3000 }).catch(() => {})
+          await result.getByRole('dialog', { name: '预览版说明', exact: true }).getByRole('button', { name: '继续', exact: true }).click()
+          if (!modelConfigured) await result.getByRole('dialog', { name: '开始使用', exact: true }).getByRole('button', { name: '关闭', exact: true }).click()
           await result.getByRole('button', { name: '设备', exact: true }).waitFor()
           return result
         }
@@ -344,7 +373,7 @@ try {
         await expect(aPage.locator('.dl-popover .empty')).toContainText('连接另一台设备，访问它的工作区')
         await expect(aPage.locator('.dl-popover').getByRole('button', { name: /连接设备/ })).toHaveCount(1)
         await aPage.getByRole('button', { name: '＋ 连接设备', exact: true }).click()
-        await aPage.getByLabel('设备地址', { exact: true }).fill(`http://${sb.listen.host}:${sb.listen.port}`)
+        await aPage.getByLabel('设备地址', { exact: true }).fill(`http://${listenB.host}:${listenB.port}`)
         await aPage.getByLabel('配对码', { exact: true }).fill(pairingCode)
         await aPage.getByRole('button', { name: '连接设备', exact: true }).click()
         await aPage.getByRole('button', { name: /harness-b.*在线/ }).click()
@@ -353,7 +382,7 @@ try {
         await aPage.getByRole('button', { name: '打开设备界面 ↗', exact: true }).click()
         const popup = await popupPromise
         await popup.getByRole('button', { name: '账号菜单', exact: true }).waitFor()
-        assert.equal(new URL(popup.url()).port, String(sb.listen.port))
+        assert.equal(new URL(popup.url()).port, String(listenB.port))
         await capture(popup, 'proxied-harness')
         await popup.close()
         await page.getByRole('button', { name: '关闭设备面板', exact: true }).click()
@@ -370,6 +399,7 @@ try {
         await expect(composer).toContainText('harness-a › workspace')
         await capture(page, 'workspace-preview-reference')
         await page.reload()
+        if (!modelConfigured) await page.getByRole('dialog', { name: '开始使用', exact: true }).getByRole('button', { name: '关闭', exact: true }).click()
         await page.getByRole('button', { name: '设备', exact: true }).click()
         await page.getByRole('tab', { name: '工作区', exact: true }).click()
         await expect(page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true })).toBeVisible()
@@ -392,7 +422,7 @@ try {
           if (!await card.locator('.dl-task-link').isVisible()) await page.getByRole('button', { name: '已调用工具', exact: true }).last().click()
           await card.locator('.dl-task-link').click()
           await expect(page.locator('.dl-transcript')).toContainText('WORKSPACE_MENTION_OK')
-          await page.getByRole('button', { name: '‹ 返回本地会话', exact: true }).click()
+          await page.getByRole('button', { name: '返回本地会话', exact: true }).click()
           await expect(composer).toContainText('返回本地后保留的草稿')
           await composer.fill('')
           await page.getByRole('button', { name: '设备', exact: true }).click()
@@ -464,7 +494,7 @@ try {
           await expect(page.getByRole('complementary', { name: '设备预览' })).toContainText(marker)
           await capture(page, 'sent-session-snapshot')
           await page.getByRole('button', { name: '关闭设备预览', exact: true }).click()
-          a = await start('a', sa.listen.port)
+          a = await start('a', listenA.port)
           await api(b, 'sync', { deviceId: peerId })
         }
         await page.getByRole('button', { name: '设备', exact: true }).click()
@@ -506,7 +536,7 @@ try {
         if (page) await capture(page, 'browser-failure')
         throw error
       } finally {
-        if (a.child.exitCode !== null) a = await start('a', sa.listen.port)
+        if (a.child.exitCode !== null) a = await start('a', listenA.port)
         await browser.close()
       }
     })

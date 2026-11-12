@@ -2,7 +2,7 @@ import type * as ReactTypes from 'react'
 import type { AccountRelation, Scope, WorkspaceFact } from '../lib/types.js'
 import type { PeerView } from '../lib/connect.js'
 import type { Diagnostic } from '../lib/network.js'
-import type { ClientContext, TabProps, ClientPrimitives, CreatePortal } from './contracts.js'
+import type { TabProps, ClientPrimitives, CreatePortal } from './contracts.js'
 import { api, message, parseAddress, parseReference, type ClientState, type Resource, type SessionSnapshot, type SentReferenceData } from './state.js'
 import { createScopeComponents } from './scope.js'
 import { createChoiceField } from './choice-field.js'
@@ -12,7 +12,7 @@ import { relativeTime, workspaceName } from '../lib/presentation.js'
 const defaultScope = (same = false): Scope => ({ workspaces: same ? 'all' : [], allowUi: same, allowDelegate: same, sessionSync: same ? 'content' : 'none', sessionIds: 'all' })
 const time = (value?: string | null) => value ? new Date(value).toLocaleString() : '尚未同步'
 
-export function createComponents(React: typeof ReactTypes, ctx: ClientContext, state: ClientState, primitives: ClientPrimitives, createPortal: CreatePortal) {
+export function createComponents(React: typeof ReactTypes, state: ClientState, primitives: ClientPrimitives, createPortal: CreatePortal) {
   const { MarkdownText } = primitives
   const { useState, useEffect, useRef, useSyncExternalStore } = React
   const ChoiceField = createChoiceField(React, primitives, createPortal)
@@ -21,7 +21,7 @@ export function createComponents(React: typeof ReactTypes, ctx: ClientContext, s
   function Markdown({ text }: { text: string }) {
     return <div className="dl-markdown"><MarkdownText text={text} labels={{ code: { copyLabel: '复制', copiedLabel: '已复制', toolbarLabels: { codeLabel: '代码', wrapLabel: '自动换行', unwrapLabel: '取消换行' } }, footnotes: '脚注' }} /></div>
   }
-  const { TaskCard, TasksPage } = createTaskComponents(React, ctx, state, Markdown, primitives, createPortal)
+  const { TaskCard, TasksPage } = createTaskComponents(React, state, Markdown, primitives, createPortal)
   function useAction() {
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState('')

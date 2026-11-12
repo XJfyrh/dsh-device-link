@@ -19,7 +19,8 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "DESIGN.md"
+    "DESIGN.md",
+    "AGENTS.md"
   ],
   "icon": "./icon.svg",
   "engines": {
@@ -43,10 +44,11 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.check.json",
     "build": "tsc && esbuild src/client.tsx --bundle --format=iife --outfile=dist/client.js",
     "test": "tsx --test --test-timeout=20000 test/*.test.ts",
     "test:e2e": "npm run build && node --env-file-if-exists=.env --import tsx scripts/e2e-two-instance.ts",
+    "test:e2e:protocol": "npm run build && node --import tsx scripts/e2e-two-instance.ts --protocol-only",
     "prepack": "npm run build"
   }
 }

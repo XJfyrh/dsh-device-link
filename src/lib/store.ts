@@ -18,21 +18,36 @@ function newState(deviceName?: string): State {
   }
 }
 
+function parseState(source: string): State {
+  const parsed: unknown = JSON.parse(source)
+  const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
+  if (!object(parsed) || parsed.version !== STORE_VERSION
+    || !object(parsed.identity) || typeof parsed.identity.deviceId !== 'string' || !parsed.identity.deviceId
+    || typeof parsed.identity.name !== 'string' || typeof parsed.identity.createdAt !== 'string'
+    || !object(parsed.serve) || typeof parsed.serve.port !== 'number' || typeof parsed.serve.bindAddress !== 'string'
+    || typeof parsed.serve.allowIncoming !== 'boolean' || typeof parsed.serve.lastAddress !== 'string'
+    || !object(parsed.trusted) || !object(parsed.peers) || !Array.isArray(parsed.favorites)
+    || !object(parsed.incomingTasks) || !object(parsed.outgoingTasks) || !object(parsed.taskCancellations)) {
+    throw new Error('device store does not match the current schema')
+  }
+  return parsed as unknown as State
+}
+
 export async function openStore({ home, log = console, deviceName }: { home?: string; log?: Logger; deviceName?: string } = {}): Promise<Store> {
   const directory = storeDir(home)
   const file = storeFile(home)
   await fs.mkdir(directory, { recursive: true })
   let state = newState(deviceName)
+  let source: string | undefined
   try {
-    const parsed = JSON.parse(await fs.readFile(file, 'utf8')) as State
-    if (parsed.version !== STORE_VERSION || !parsed.identity?.deviceId || !parsed.serve || !parsed.trusted || !parsed.peers) {
-      throw new Error('invalid v2 device store')
-    }
-    state = { ...parsed, favorites: parsed.favorites ?? [], incomingTasks: parsed.incomingTasks ?? {}, outgoingTasks: parsed.outgoingTasks ?? {}, taskCancellations: parsed.taskCancellations ?? {} }
+    source = await fs.readFile(file, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  if (source !== undefined) {
+    try { state = parseState(source) } catch (error) {
       await fs.rename(file, `${file}.corrupt-${Date.now()}`)
-      log.warn?.(`device store backed up after read failure: ${errorMessage(error)}`)
+      log.warn?.(`device store backed up after validation failure: ${errorMessage(error)}`)
     }
   }
   async function save(value: State): Promise<void> {
@@ -48,7 +63,6 @@ export async function openStore({ home, log = console, deviceName }: { home?: st
   let queue = Promise.resolve()
   return {
     path: file, directory,
-    async load() { return structuredClone(state) },
     state() { return structuredClone(state) },
     update(mutator) {
       const operation = queue.then(async () => {

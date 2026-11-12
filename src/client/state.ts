@@ -166,9 +166,14 @@ export function createClientState(ctx: ClientContext) {
       sessionId: task.resumeSessionId, originSessionId: task.originSessionId, selection: task.selection })
       .then(async result => {
         if (localTasks[id]?.cancelRequested) result = await api<{ task: OutgoingTask }>('task-cancel', { id })
+        const confirmed = view.tasks.find(task => task.id === id)
+        if (confirmed?.remote && (!result.task.remote || Date.parse(confirmed.remote.updatedAt) > Date.parse(result.task.remote.updatedAt))) result = { task: confirmed }
         delete localTasks[id]; persist(); putTask(result.task); return result.task
       })
       .catch(cause => {
+        // Polling may confirm delivery before this older submission loses its response.
+        const confirmed = !localTasks[id] && view.tasks.find(task => task.id === id)
+        if (confirmed) return confirmed
         const failed = { ...task, connectionError: message(cause), submission: cause instanceof ApiError && cause.status >= 400 && cause.status < 500 ? 'failed' as const : 'pending' as const }
         localTasks[id] = failed; persist(); putTask(failed); return failed
       }).finally(() => submissions.delete(id))

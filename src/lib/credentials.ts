@@ -1,24 +1,8 @@
 import type { Logger } from './types.js'
-/**
- * Owner credentials: exchange the plugin's authenticated GUI URL for the owner browser cookie.
- *
- * The Harness web server answers `GET <origin>/?token=<process-token>` with `302` + `Set-Cookie`
- * (the owner session cookie, valid for weeks). We cache that cookie and hand it to the proxy,
- * which replays it on every forwarded request. `invalidate()` drops the cache after a 401/403 so
- * the next `getCookie()` performs a fresh exchange.
- */
+// The owner cookie stays in this process; the LAN proxy supplies it to the local GUI.
 
 const EXCHANGE_TIMEOUT_MS = 5_000
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307])
-
-function getSetCookies(headers: Headers) {
-  if (!headers) return []
-  if (typeof headers.getSetCookie === 'function') return headers.getSetCookie()
-  // Fallback for fetch implementations without the split API: a combined header only yields the
-  // first cookie reliably, which is exactly what we need.
-  const combined = headers.get?.('set-cookie')
-  return combined ? [combined] : []
-}
 
 /** `name=value` only: attributes (Path, HttpOnly, Expires, …) are not part of a Cookie header. */
 function firstCookiePair(setCookies: string[]) {
@@ -30,9 +14,9 @@ function firstCookiePair(setCookies: string[]) {
 
 async function discardBody(response: Response) {
   try {
-    await response.body?.cancel?.()
+    await response.body?.cancel()
   } catch {
-    // A cancelled body is best effort; the connection is not replayed.
+    // Body cleanup must not mask the exchange's HTTP status.
   }
 }
 
@@ -45,25 +29,12 @@ export function createOwnerCredentials({
   let cookie: string | undefined
   let inflight: Promise<string> | null = null
 
-  /**
-   * `getAuthenticatedUrl()` may return either the full authenticated URL (the real Harness
-   * contract: `origin/?token=…`) or a bare token. Both are accepted.
-   */
   async function resolveExchangeUrl() {
-    const raw = await getAuthenticatedUrl()
-    const value = typeof raw === 'string' ? raw.trim() : raw == null ? '' : String(raw).trim()
-    if (!value) throw new Error('web GUI authentication token unavailable')
-    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
-      // Absolute URL: use it verbatim. When it carries `?token=` it is already the exchange URL;
-      // an absolute URL without a token is still the caller's best description of the endpoint.
-      return new URL(value).toString()
+    const url = new URL(await getAuthenticatedUrl())
+    if (url.origin !== new URL(origin).origin || url.username || url.password || !url.searchParams.get('token')) {
+      throw new Error('web GUI authentication URL must contain a token for the GUI origin')
     }
-    const base = origin.replace(/\/+$/, '')
-    if (value.startsWith('/')) {
-      const relative = new URL(value, `${base}/`)
-      if (relative.searchParams.has('token')) return relative.toString()
-    }
-    return `${base}/?token=${encodeURIComponent(value)}`
+    return url.toString()
   }
 
   async function runRefresh() {
@@ -77,14 +48,13 @@ export function createOwnerCredentials({
     const status = response.status
 
     if (status === 200 || REDIRECT_STATUSES.has(status)) {
-      const pair = firstCookiePair(getSetCookies(response.headers))
+      const pair = firstCookiePair(response.headers.getSetCookie())
       await discardBody(response)
       if (!pair) {
         throw new Error(
           `owner cookie exchange returned HTTP ${status} without a usable Set-Cookie header (origin ${origin})`,
         )
       }
-      cookie = pair
       log?.info?.(`owner cookie acquired (HTTP ${status})`)
       return pair
     }
@@ -97,7 +67,10 @@ export function createOwnerCredentials({
   function refresh() {
     if (!origin) return Promise.reject(new Error('web GUI origin unavailable'))
     if (inflight) return inflight
-    const pending = runRefresh()
+    const pending = runRefresh().then(pair => {
+      if (inflight === pending) cookie = pair
+      return pair
+    })
     inflight = pending
     const clear = () => {
       if (inflight === pending) inflight = null
@@ -106,13 +79,11 @@ export function createOwnerCredentials({
     return pending
   }
 
-  /** Cached owner cookie; exchanges it once on first use or after `invalidate()`. */
   async function getCookie() {
     if (cookie) return cookie
     return refresh()
   }
 
-  /** Drop the cached cookie (call on 401/403 from the GUI; the next read re-exchanges). */
   function invalidate() {
     cookie = undefined
     inflight = null

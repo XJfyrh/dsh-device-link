@@ -398,9 +398,6 @@ export const styles = `
   cursor:pointer;
   padding:9px 0;
 }
-.dl .scope-hint {
-  margin-top:10px;
-}
 .dl-preview {
   height:100%;
   min-width:0;
@@ -597,40 +594,12 @@ export const styles = `
   .dl .dl-execution-target { max-width:100%; }
   .dl-composer-trailing { gap:8px; }
 }
-.dl-composer {
-  border:1px solid var(--dl-line);
-  border-radius:13px;
-  padding:18px;
-  margin:24px 0;
-  background:var(--dl-layer);
-}
-.dl-composer textarea {
-  min-height:130px;
-  margin:14px 0;
-}
 .dl-task {
   border:1px solid var(--dl-line);
   border-radius:11px;
   padding:14px 16px;
   margin:12px 0;
   background:var(--dl-bg);
-}
-.dl-task .task-prompt {
-  margin:9px 0;
-  white-space:pre-wrap;
-  overflow-wrap:anywhere;
-}
-.dl-task pre {
-  max-height:320px;
-  overflow:auto;
-  margin:12px 0;
-}
-.dl-task .task-output {
-  border-top:1px solid var(--dl-line);
-  padding-top:12px;
-}
-.dl-task .actions {
-  margin-top:12px;
 }
 .dl-task .task-state {
   font:var(--dsw-font-xxs-12,400 12px/18px var(--dsw-font-family,system-ui,sans-serif));

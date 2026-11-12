@@ -37,7 +37,6 @@ export async function bootstrap(ctx: HostContext, rawConfig: Record<string, unkn
     store, pairing, proxy, factsProvider: hostFacts,
     sessionProvider: (id, scope) => readSessionContent(ctx, id, scope),
     executionProvider: (workspace, sessionId) => executionContext(ctx, workspace, sessionId),
-    delegateProvider: delegation.run,
     taskManager,
   })
   const connector = createConnector({ store })

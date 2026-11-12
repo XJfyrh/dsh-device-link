@@ -117,7 +117,6 @@ export interface OutgoingTask {
 export interface Store {
   path: string
   directory: string
-  load(): Promise<State>
   state(): State
   update(mutator: (draft: State) => void | Promise<void>): Promise<State>
 }
@@ -129,17 +128,16 @@ export interface Logger {
 export interface DelegateInput {
   workspacePath: string
   task: string
-  timeoutMs?: number
   signal?: AbortSignal
   confineWorkspace?: boolean
   sessionId?: string
   resume?: boolean
-  requestId?: string
+  requestId: string
   selection?: ModelSelection
   onProgress?(progress: { sessionId: string; baselineSeq: number; text: string; provider?: string; model?: string; reasoningEffort?: string }): Promise<void>
 }
 export interface DelegateResult {
-  status: 'completed' | 'timeout' | 'error'
+  status: 'completed' | 'error'
   sessionId: string
   text: string
   error?: string

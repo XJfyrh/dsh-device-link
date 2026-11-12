@@ -84,7 +84,6 @@ export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntim
         else if (route === 'session') result = body.refresh === true
           ? await connector.fetchSession(peer, String(body.sessionId ?? ''))
           : connector.cachedSession(peer, String(body.sessionId ?? ''))
-        else if (route === 'delegate') result = await connector.delegate(peer, { workspacePath: String(body.workspacePath ?? ''), task: String(body.task ?? ''), timeoutMs: Number(body.timeoutMs) || 300_000 })
         else throw new HttpError(404, 'unknown device-link endpoint')
       }
     }
