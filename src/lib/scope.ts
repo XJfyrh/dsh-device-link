@@ -18,7 +18,7 @@ export function normalizeScope(value: unknown): Scope {
     || typeof input.allowReadFiles !== 'boolean' || typeof input.sessionTools !== 'boolean') {
     throw new HttpError(400, 'allowUi, allowDelegate, allowReadFiles and sessionTools must be boolean')
   }
-  if (!['none', 'metadata', 'content'].includes(String(input.sessionSync))) throw new HttpError(400, 'invalid sessionSync')
+  if (typeof input.sessionSync !== 'string' || !['none', 'metadata', 'content'].includes(input.sessionSync)) throw new HttpError(400, 'invalid sessionSync')
   if (input.sessionIds !== 'all' && (!Array.isArray(input.sessionIds) || !input.sessionIds.every(id => typeof id === 'string' && id.length > 0))) {
     throw new HttpError(400, 'sessionIds must be all or an array of session ids')
   }

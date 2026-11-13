@@ -3,10 +3,10 @@ import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { HostContext, HostEvent } from './host.js'
 import { contentText } from './host-facts.js'
-import { currentSelection, selectForTask, parseSelection } from './models.js'
+import { selectForTask, parseSelection } from './models.js'
 import { type DelegateInput, type DelegateResult, type Logger, type ModelSelection, HttpError, errorMessage, record } from './types.js'
 
-function requestTurn(events: HostEvent[], baseline: number, requestId: string): unknown {
+export function requestTurn(events: HostEvent[], baseline: number, requestId: string): unknown {
   let turn: unknown
   for (const event of events) {
     if (event.seq < baseline) continue
@@ -59,6 +59,7 @@ export function createDelegationRunner({ ctx, log = console }: { ctx: Pick<HostC
     const signal = input.signal ? AbortSignal.any([abort.signal, input.signal]) : abort.signal
     running.set(sessionId, abort)
     const key = sessionId
+    let errorPhase: 'startup' | 'execution' = 'startup'
     try {
       signal.throwIfAborted()
       if (input.resume) {
@@ -67,13 +68,19 @@ export function createDelegationRunner({ ctx, log = console }: { ctx: Pick<HostC
         if (resumed.agent.status === 'running') throw new HttpError(409, '设备会话正在执行任务，请等待当前任务结束')
         if (path.resolve(resumed.agent.session.header.cwd ?? '') !== path.resolve(input.workspacePath)) throw new Error('session workspace does not match the delegated workspace')
       } else {
-        const created = await controller.create({ sessionId, cwd: input.workspacePath })
+        const workspaces = ctx.get('workspaceController')
+        if (!workspaces) throw new Error('Harness workspaceController service unavailable')
+        // The host reuses an existing registration by real path. cwd alone creates an ungrouped session.
+        const { workspace } = await workspaces.create({ path: input.workspacePath })
+        signal.throwIfAborted()
+        const created = await controller.create({ sessionId, workspaceId: workspace.workspaceId })
         sessionId = created.sessionId
       }
       signal.throwIfAborted()
       const sessions = ctx.get('sessions')
       const session = sessions?.get(sessionId)
       if (!session) throw new Error('created session is unavailable')
+      if (path.resolve(session.header.cwd ?? '') !== path.resolve(input.workspacePath)) throw new Error('session workspace does not match the delegated workspace')
       if (input.confineWorkspace) {
         const permissions = ctx.get('permissionPresets')
         const sandbox = ctx.get('sandboxPolicy')
@@ -92,9 +99,10 @@ export function createDelegationRunner({ ctx, log = console }: { ctx: Pick<HostC
         signal.throwIfAborted()
       }
       if (agent?.status === 'running') throw new HttpError(409, '设备会话正在执行任务，请稍后发送')
-      let model = agent ? currentSelection(ctx, agent) ?? agent.options : undefined
+      let model = agent?.model.current()
       await input.onProgress?.({ sessionId, baselineSeq: baseline, text: '', provider: model?.provider, model: model?.model })
       await controller.prompt({ requestId: input.requestId, sessionId, mode: 'queue', content: [{ type: 'text', text: input.task }] }, signal)
+      errorPhase = 'execution'
       let lastProgress = ''
       let nextProgress = Date.now() + 1000
       while (true) {
@@ -127,17 +135,25 @@ export function createDelegationRunner({ ctx, log = console }: { ctx: Pick<HostC
     } catch (error) {
       if (signal.aborted) {
         try {
-          await controller.cancel({ sessionId })
-          const events = ctx.get('sessions')?.get(sessionId)?.snapshotEvents() ?? []
-          const end = delegationEnd(events, 0, input.requestId)
-          if (end && record(end.data.reason).kind === 'completed') return { status: 'completed', sessionId, text: delegationText(events, 0, input.requestId) }
+          // Host cancellation is session-wide; it must not stop work outside this admitted request.
+          if (errorPhase === 'execution') {
+            const session = ctx.get('sessions')?.get(sessionId)
+            let events = session?.snapshotEvents() ?? []
+            let end = delegationEnd(events, 0, input.requestId)
+            if (!end) {
+              await controller.cancel({ sessionId })
+              events = session?.snapshotEvents() ?? []
+              end = delegationEnd(events, 0, input.requestId)
+            }
+            if (end && record(end.data.reason).kind === 'completed') return { status: 'completed', sessionId, text: delegationText(events, 0, input.requestId) }
+          }
           return { status: 'error', sessionId, text: '', error: errorMessage(error), cancelled: true }
         } catch (cause) {
           log.warn?.(errorMessage(cause))
-          return { status: 'error', sessionId, text: '', error: `${errorMessage(error)}; cancellation failed: ${errorMessage(cause)}` }
+          return { status: 'error', sessionId, text: '', error: `${errorMessage(error)}; cancellation failed: ${errorMessage(cause)}`, errorPhase }
         }
       }
-      return { status: 'error', sessionId, text: '', error: errorMessage(error) }
+      return { status: 'error', sessionId, text: '', error: errorMessage(error), errorPhase }
     } finally {
       running.delete(key)
     }

@@ -4,7 +4,7 @@ import { constants } from 'node:fs'
 import type { HostContext } from './host.js'
 import { authorizedWorkspace, isPathAllowed, sessionAllowed } from './scope.js'
 import { evidenceEvent, hasCurrentEvidence, revisionOf } from './evidence.js'
-import { HttpError, type EvidenceEvent, type Scope, type CachedSession, type SessionTaskEvidence } from './types.js'
+import { HttpError, record, type EvidenceEvent, type Scope, type CachedSession, type SessionTaskEvidence } from './types.js'
 
 export interface ResourceTarget { kind: 'workspace' | 'session'; workspacePath: string; sessionId?: string }
 export interface ResourceRequest extends ResourceTarget {
@@ -144,7 +144,7 @@ async function workspaceQuery(input: ResourceRequest, scope: Scope): Promise<Res
     currentDirectory = path.join(currentDirectory, part)
     if ((await fs.lstat(currentDirectory)).isSymbolicLink()) throw new HttpError(403, '不遍历符号链接目录')
   }
-  const queue = [directory]; let scanned = 0; let skipped = 0
+  const queue = [directory]; let scanned = 0; let skipped = 0; let readable = 0
   while (queue.length && scanned < 1500 && result.items.length < 20) {
     const dir = queue.shift()!
     const location = path.join(root, dir)
@@ -158,6 +158,7 @@ async function workspaceQuery(input: ResourceRequest, scope: Scope): Promise<Res
       if (!entry.isFile()) continue
       try {
         const file = await readFile(root, relative)
+        readable++
         if (input.action === 'inspect') { result.items.push({ title: entry.name, path: relative, revision: file.revision }); continue }
         const lines = file.text.split('\n')
         const line = lines.findIndex(text => matches(text, input.query!))
@@ -170,7 +171,7 @@ async function workspaceQuery(input: ResourceRequest, scope: Scope): Promise<Res
   }
   result.truncated ||= queue.length > 0 || scanned >= 1500
   result.coverage += `；检查 ${scanned} 个条目，跳过 ${skipped} 项${result.truncated ? '；已达扫描或结果上限，请缩小范围' : ''}`
-  if (!result.items.length) result.emptyReason = scanned === 0 ? 'empty-directory' : input.action === 'search' ? 'no-matches' : 'no-readable-files'
+  if (!result.items.length) result.emptyReason = scanned === 0 ? 'empty-directory' : readable === 0 ? 'no-readable-files' : 'no-matches'
   return result
 }
 export function createResourceProvider(ctx: Pick<HostContext, 'get'>) {
@@ -180,9 +181,12 @@ export function createResourceProvider(ctx: Pick<HostContext, 'get'>) {
     if (scope.sessionSync !== 'content' || !sessionAllowed({ id: input.sessionId!, cwd: input.workspacePath }, scope)) throw new HttpError(403, '会话正文未授权', 'scope')
     const query = ctx.get('sessionQuery')
     if (!query) throw new HttpError(503, '当前 DSH 未提供会话查询服务')
-    const snapshot = input.action === 'read'
-      ? await query.readEvent({ sessionId: input.sessionId!, seq: integer(input.seq, -1) }).then(read => ({ session: read.session, events: [read.target] }))
-      : await query.readSession(input.sessionId!)
+    const snapshot = await (input.action === 'read'
+      ? query.readEvent({ sessionId: input.sessionId!, seq: integer(input.seq, -1) }).then(read => ({ session: read.session, events: [read.target] }))
+      : query.readSession(input.sessionId!)).catch(error => {
+        if (record(error).code === 'SESSION_QUERY_SESSION_NOT_FOUND' || record(error).code === 'SESSION_QUERY_EVENT_NOT_FOUND') throw new HttpError(404, '会话或事件已不存在')
+        throw error
+      })
     if (snapshot.session.cwd !== input.workspacePath) throw new HttpError(403, '会话工作区已变化', 'scope')
     const evidence = snapshot.events.map(event => evidenceEvent(event, scope.sessionTools === true, Infinity)).filter((event): event is EvidenceEvent => Boolean(event))
     return queryEvidence(evidence, input, 'device', new Date().toISOString(), evidence.some(event => event.truncated))

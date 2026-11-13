@@ -4,7 +4,7 @@ import type { PeerView } from '../lib/connect.js'
 import type { Diagnostic } from '../lib/network.js'
 import type { TabProps, ClientPrimitives, CreatePortal } from './contracts.js'
 import { api, cacheLabel, message, openDeviceUi, parseAddress, parseReference, type ClientState, type Resource, type SessionSnapshot, type SentReferenceData } from './state.js'
-import { statusLabels } from './conversation.js'
+import { taskStatusLabel } from './conversation.js'
 import { createScopeComponents } from './scope.js'
 import { createChoiceField } from './choice-field.js'
 import { createTaskComponents } from './tasks.js'
@@ -60,11 +60,13 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
   function Sidebar({ wide }: { wide: boolean }) {
     const view = useView()
     const online = view.data?.peers.filter(peer => peer.online).length ?? 0
+    const incoming = view.data?.trusted.length ?? 0
+    const summary = incoming ? `${online ? `${online} 在线，` : ''}已授权 ${incoming} 台` : `${online} 在线`
     return <div className="dl dl-footer">
-      <button className={`device-trigger ${wide ? '' : 'rail'}`} aria-label="设备" title={`${online} 台设备在线`} aria-expanded={view.panel !== null} aria-haspopup="dialog"
+      <button className={`device-trigger ${wide ? '' : 'rail'}`} aria-label="设备" title={summary} aria-expanded={view.panel !== null} aria-haspopup="dialog"
         onClick={() => state.change({ panel: view.panel ? null : 'list' })}>
         <DeviceIcon />
-        {wide ? <><span className="grow">设备</span><small>{!view.data || view.data.peers.some(peer => peer.checking) ? '检查中…' : `${online} 在线`}</small></> : online > 0 && <i className="dot online" aria-hidden="true" />}
+        {wide ? <><span className="grow">设备</span><small>{!view.data || view.data.peers.some(peer => peer.checking) ? '检查中…' : summary}</small></> : online > 0 && <i className="dot online" aria-hidden="true" />}
       </button>
     </div>
   }
@@ -121,7 +123,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
       <label><input type="checkbox" checked={view.data?.allowIncoming ?? false} disabled={action.busy} onChange={event => void action.run(async () => { await api('toggle', { allowIncoming: event.target.checked }); await state.refresh() })} />允许局域网设备连接</label>
       <ChoiceField<AccountRelation> label="首次配对的账号关系" value={relation} onChange={value => { setRelation(value); setScope(defaultScope(value === 'same-account')) }} options={[
         { value: 'unknown', label: '待确认' }, { value: 'same-account', label: '我已确认使用同一账号' }, { value: 'different-account', label: '使用不同账号' },
-      ]} /><ScopeFields value={scope} onChange={setScope} workspaces={view.data?.host.workspaces} sessions={view.data?.host.sessions} />
+      ]} /><ScopeFields value={scope} onChange={setScope} workspaces={view.data.host.workspaces} sessions={view.data.host.sessions} platform={view.data.host.platform} />
       <button className="primary" disabled={action.busy || !view.data?.allowIncoming} onClick={() => void action.run(async () => { await api('allow', { relationship: relation, scope: cleanScope(scope) }); await state.refresh() })}>生成配对码</button>
       {remaining > 0 && <div><p className="code">{view.data?.pairing?.code}</p><small>{remaining} 秒后过期，只能使用一次</small><button onClick={() => void action.run(async () => { await api('close-pairing', {}); await state.refresh() })}>关闭配对码</button></div>}
       <ErrorText text={action.error} /></>
@@ -196,20 +198,24 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
     }, [route])
     if (!route || route === 'settings') return null
     const peer = view.data?.peers.find(item => item.deviceId === route)
+    const incoming = view.data?.trusted.find(item => `incoming:${item.deviceId}` === route)
     const search = query.trim().toLowerCase()
     const peers = (view.data?.peers ?? []).filter(peer => `${peer.name} ${peer.status?.host.workspaces.map(item => `${item.title} ${item.path}`).join(' ')}`.toLowerCase().includes(search))
+    const trusted = (view.data?.trusted ?? []).filter(item => item.name.toLowerCase().includes(search))
     const root = route === 'list' || route === 'all'
     const groups = peers.map(peer => ({ peer, workspaces: (peer.status?.host.workspaces ?? []).filter(workspace => `${peer.name} ${workspace.title} ${workspace.path}`.toLowerCase().includes(search)) })).filter(group => group.workspaces.length)
     const saved = (peer: PeerView, workspace: WorkspaceFact) => view.data?.favorites.some(item => item.deviceId === peer.deviceId && item.path === workspace.path)
     return <section ref={dialog} className="dl dl-popover" role="dialog" aria-modal="true" tabIndex={-1} aria-label="设备面板">
-      <header className="row between"><div>{root ? <h2>设备</h2> : <button className="dl-icon-label" onClick={() => managing ? setManaging(false) : state.change({ panel: 'list' })}><primitives.IconChevronLeftOutlineRegular size={14} />{peer ? managing ? '设备资源' : '设备列表' : route === 'pair' ? '连接新设备' : '允许连接本机'}</button>}</div>
+      <header className="row between"><div>{root ? <h2>设备</h2> : <button className="dl-icon-label" onClick={() => managing ? setManaging(false) : state.change({ panel: 'list' })}><primitives.IconChevronLeftOutlineRegular size={14} />{incoming ? '设备列表' : peer ? managing ? '设备资源' : '设备列表' : route === 'pair' ? '连接新设备' : '允许连接本机'}</button>}</div>
         <div className="row">{root && <button className="primary" onClick={() => state.change({ panel: 'pair' })}>＋ 连接设备</button>}<button aria-label="关闭设备面板" onClick={() => state.change({ panel: null })}>×</button></div>
       </header>
       {root && <><div className="tabs dl-panel-tabs" role="tablist" aria-label="浏览设备与工作区"><button role="tab" aria-selected={route === 'list'} onClick={() => { setQuery(''); state.change({ panel: 'list' }) }}>设备</button><button role="tab" aria-selected={route === 'all'} onClick={() => { setQuery(''); state.change({ panel: 'all' }) }}>工作区</button></div><div className="search"><input aria-label={route === 'list' ? '搜索设备' : '搜索工作区'} placeholder={route === 'list' ? '搜索设备' : '搜索工作区'} value={query} onChange={event => setQuery(event.target.value)} /></div></>}
       <div className="body"><ErrorText text={view.error} />{route === 'pair' && <PairForm />}{route === 'host' && <HostPairing />}{peer && <PeerDetail key={peer.deviceId} peer={peer} managing={managing} setManaging={setManaging} />}
-        {route === 'list' && <>{peers.map(peer => <button className="dl-device-row" key={peer.deviceId} onClick={() => state.change({ panel: peer.deviceId })}>
+        {incoming && view.data && <><h3>已授权连接本机</h3><TrustedCard device={incoming} workspaces={view.data.host.workspaces} sessions={view.data.host.sessions} platform={view.data.host.platform} changed={async () => { await state.refresh(); if (!state.getSnapshot().data?.trusted.some(item => item.deviceId === incoming.deviceId)) state.change({ panel: 'list' }) }} /></>}
+        {route === 'list' && <>{!!peers.length && <h3 className="section-label">本机连接的设备</h3>}{peers.map(peer => <button className="dl-device-row" key={peer.deviceId} onClick={() => state.change({ panel: peer.deviceId })}>
           <DeviceIcon /><span className="grow"><strong>{peer.name}</strong><small className="dl-meta"><span>{peer.status?.host.workspaces.length ?? 0} 个工作区</span><span>{peer.cachedSessionIds.length} 个缓存会话</span></small></span><Status peer={peer} /><NavigationArrow />
-        </button>)}{!peers.length && <div className="empty"><p>{!view.data ? '正在加载设备…' : search ? '未找到设备' : '连接另一台设备，访问它的工作区'}</p></div>}
+        </button>)}{!!trusted.length && <section className={peers.length ? 'divider' : ''} aria-label="已授权连接本机"><h3 className="section-label">已授权连接本机</h3>{trusted.map(device => <button className="dl-device-row" key={device.deviceId} onClick={() => state.change({ panel: `incoming:${device.deviceId}` })}><DeviceIcon /><span className="grow"><strong>{device.name}</strong><small>{view.data?.allowIncoming ? '可访问本机授权的内容' : '本机接入已关闭'}</small></span><span className="muted">管理授权</span><NavigationArrow /></button>)}</section>}
+        {!peers.length && !trusted.length && <div className="empty"><p>{!view.data ? '正在加载设备…' : search ? '未找到设备' : '连接另一台设备，访问它的工作区'}</p></div>}
         </>}
         {route === 'all' && <><Favorites query={search} />{groups.map(({ peer, workspaces }) => {
           const remaining = workspaces.filter(workspace => !saved(peer, workspace))
@@ -222,11 +228,12 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
     const view = useView()
     const action = useAction()
     if (!view.data) return <div className="dl dl-settings"><h2>设备连接设置</h2><ErrorText text={view.error} /><p role="status">正在加载本机设置…</p></div>
+    const host = view.data.host
     return <div className="dl dl-settings"><h2>设备连接设置</h2><ErrorText text={view.error || action.error} />
       <section><LocalDeviceName /><p className="path">监听地址：{view.data?.listen?.host}:{view.data?.listen?.port}</p>
         <label><input type="checkbox" checked={view.data?.allowIncoming ?? false} disabled={action.busy} onChange={event => void action.run(async () => { await api('toggle', { allowIncoming: event.target.checked }); await state.refresh() })} />允许局域网设备连接</label>
         <button className="outline" onClick={() => state.change({ panel: 'host' })}>生成配对码</button>
-      </section><section><h3>已授权连接本机的设备</h3>{view.data?.trusted.map(device => <TrustedCard key={device.deviceId} device={device} workspaces={view.data?.host.workspaces} sessions={view.data?.host.sessions} changed={() => void state.refresh()} />)}{!view.data?.trusted.length && <p className="muted">尚未授权设备</p>}</section>
+      </section><section><h3>已授权连接本机的设备</h3>{view.data.trusted.map(device => <TrustedCard key={device.deviceId} device={device} workspaces={host.workspaces} sessions={host.sessions} platform={host.platform} changed={state.refresh} />)}{!view.data.trusted.length && <p className="muted">尚未授权设备</p>}</section>
       <section><h3>连接与运行配置</h3><p className="muted">在 Harness 插件配置中设置监听地址和端口。跨物理机连接使用本机局域网 IPv4 地址。</p><dl className="dl-facts"><dt>当前地址</dt><dd>{view.data?.addresses.map(address => <div key={address}>{address}</div>)}</dd></dl><button className="outline" onClick={() => state.change({ panel: 'list' })}>管理已连接设备</button></section>
     </div>
   }
@@ -268,7 +275,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
           {snapshot && <><small>缓存于 {time(snapshot.cachedAt)}{snapshot.session.truncated ? '，内容已截断' : ''}</small>
             {snapshot.session.messages.map((item, index) => <div className="message" data-role={item.role} key={item.seq ?? index} onMouseUp={event => { const selected = window.getSelection(); const text = selected?.anchorNode && event.currentTarget.contains(selected.anchorNode) && selected.focusNode && event.currentTarget.contains(selected.focusNode) ? selected.toString().slice(0, 4000) : ''; setSelectedText(text ? { text, seq: item.seq } : undefined) }}><strong>{item.role === 'user' ? '用户' : '智能体'}</strong>{item.role === 'assistant' ? <Markdown text={item.text} /> : <p>{item.text}</p>}</div>)}
             {!snapshot.session.messages.length && <p className="empty">此会话暂无对话正文</p>}
-            {snapshot.session.tasks?.map(task => <section key={task.id}><h3>{statusLabels[task.status]}</h3><p>{task.prompt}</p>{task.error && <p className="error">{task.error}</p>}{task.text && <Markdown text={task.text} />}{task.truncated && <small>任务记录已截断</small>}</section>)}</>}
+            {snapshot.session.tasks?.map(task => <section key={task.id}><h3>{taskStatusLabel(task.status, task.errorPhase)}</h3><p>{task.prompt}</p>{task.error && <p className="error">{task.error}</p>}{task.text && <Markdown text={task.text} />}{task.truncated && <small>任务记录已截断</small>}</section>)}</>}
           {peer?.online && peer.status?.scope.sessionSync === 'content' && <button className="outline" disabled={action.busy} onClick={() => void action.run(syncSession)}>更新会话缓存</button>}
         </> : <><div className="actions"><button className="primary" disabled={!peer?.online || !peer.status?.scope.allowDelegate} onClick={() => state.execute(actual)}>新建任务</button>
           <button className="outline" disabled={!peer} onClick={() => void action.run(() => state.quote(actual, sessionId))}>添加到当前任务</button>

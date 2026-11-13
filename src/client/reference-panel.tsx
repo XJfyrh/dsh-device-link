@@ -3,7 +3,7 @@ import { api, message, type ClientState, type Resource } from './state.js'
 import type { ClientPrimitives } from './contracts.js'
 import type { ReadReceipt, ReferenceDescriptor } from '../lib/references.js'
 import type { ResourceItem, ResourceRequest, ResourceResult } from '../lib/resources.js'
-import { statusLabels } from './conversation.js'
+import { taskStatusLabel } from './conversation.js'
 
 interface Page { result: ResourceResult; receipt?: ReadReceipt; query?: string; directory?: string }
 
@@ -109,7 +109,7 @@ export function createReferencePanel(React: typeof ReactTypes, state: ClientStat
                 {item.text && <span className="dl-search-excerpt">{item.text}</span>}</span><primitives.IconChevronRightOutlineRegular size={14} />
             </button>}
         </div>)}
-        {result.tasks?.map(task => <section key={task.id}><h3>{statusLabels[task.status]}</h3><p>{task.prompt}</p>{task.error && <p className="error">{task.error}</p>}{task.text && <p>{task.text}</p>}{task.truncated && <small>任务记录已截断</small>}</section>)}
+        {result.tasks?.map(task => <section key={task.id}><h3>{taskStatusLabel(task.status, task.errorPhase)}</h3><p>{task.prompt}</p>{task.error && <p className="error">{task.error}</p>}{task.text && <p>{task.text}</p>}{task.truncated && <small>任务记录已截断</small>}</section>)}
         {result.truncated && <p className="dl-notice">{reading ? '这次返回的内容不完整' : '仅显示部分结果'}{!recorded && result.action === 'search' ? '，请缩小搜索范围' : ''}</p>}
         {selection?.text && reading && <button className="outline" onClick={quote}>引用选中文字</button>}
         {!reading && <div className="dl-scope-detail"><button aria-expanded={showScope} onClick={() => setShowScope(!showScope)}>范围详情</button>{showScope && <p>{result.coverage}</p>}</div>}

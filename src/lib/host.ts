@@ -26,10 +26,12 @@ export interface ToolDefinition {
   output: { schema: Record<string, unknown>; render(args: unknown, value: unknown): { type: 'text'; text: string }[] }
   timeoutMs?: number
   isConcurrencySafe(): boolean
-  execute(args: Record<string, unknown>, execution?: { callId: string; signal: AbortSignal; agent?: HostAgent }): Promise<unknown>
+  execute(args: Record<string, unknown>, execution: { callId: string; signal: AbortSignal; agent?: HostAgent }): Promise<unknown>
 }
 export interface HostServices {
   workspaceRegistry: { list(): WorkspaceFact[] }
+  workspaceController: { create(request: { path: string }): Promise<{ workspace: { workspaceId: string; path: string }; created: boolean }> }
+  typertGateway: { getPendingRemoteEvents(): readonly { event: string; agentId: string | number }[] }
   sessions: { list(): HostSession[]; get(id: string): HostSession | undefined }
   agents: { list(): HostAgent[]; get(id: string): HostAgent | undefined }
   agentDefaultModel: { currentSelection(): { provider?: string; model?: string } }
@@ -42,7 +44,7 @@ export interface HostServices {
     agents: {
       serializeImageAdmission<T>(agent: HostAgent, operation: () => Promise<T>): Promise<T>
     }
-    create(request: { sessionId: string; cwd: string }): Promise<{ sessionId: string }>
+    create(request: { sessionId: string; workspaceId: string }): Promise<{ sessionId: string }>
     prompt(request: { requestId: string; sessionId: string; mode: 'queue'; content: { type: 'text'; text: string }[] }, signal: AbortSignal): Promise<unknown>
     cancel(request: { sessionId: string }): Promise<unknown>
     resolveAgent(sessionId: string): Promise<{ agent?: HostAgent; error?: { message?: string } }>

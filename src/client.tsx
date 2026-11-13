@@ -10,7 +10,7 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
   const React = require('react')
   const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
   const { createPortal } = require('react-dom')
-  return { inject: ['slots', 'inputTriggers', 'sidebarRightTabs', 'sidebarRight', 'layout', 'sessions', 'conversation', 'uiWorkspace', 'uiConversation'], apply(ctx) {
+  return { inject: ['slots', 'inputTriggers', 'sidebarRightTabs', 'sidebarRight', 'layout', 'sessions', 'workspaces', 'conversation', 'uiWorkspace', 'uiConversation'], apply(ctx) {
     const state = createClientState(ctx)
     const components = createComponents(React, state, primitives, createPortal)
     ctx.effect(() => {
@@ -19,6 +19,23 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
       return () => style.remove()
     })
     ctx.effect(() => state.start())
+    ctx.effect(() => {
+      const url = new URL(window.location.href)
+      const sessionId = url.searchParams.get('deviceLinkSession')
+      if (!sessionId || !/^[a-zA-Z0-9_-]{1,200}$/.test(sessionId)) return () => {}
+      let opened = false
+      let disposed = false
+      // Run after the feed listeners start host restoration; openSession supersedes that navigation.
+      const open = () => {
+        if (opened || ctx.sessions.list.getSnapshot().phase !== 'ready' || ctx.workspaces.list.getSnapshot().phase !== 'ready') return
+        opened = true
+        queueMicrotask(() => { if (!disposed) ctx.uiWorkspace.openSession(sessionId) })
+      }
+      const stopSessions = ctx.sessions.list.subscribe(open)
+      const stopWorkspaces = ctx.workspaces.list.subscribe(open)
+      open()
+      return () => { disposed = true; stopSessions(); stopWorkspaces() }
+    })
     ctx.slots.inject('settings.section.icon', () => ctx.slots.register({ name: 'settings.section.icon', id: 'device-link' }, createDeviceIcon(React)))
     ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'device-link', order: 16, label: '设备连接' }, components.Settings))
     ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'device-link', order: 20 }, components.Sidebar))

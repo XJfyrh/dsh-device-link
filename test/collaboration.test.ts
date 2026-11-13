@@ -32,13 +32,14 @@ async function harness(t: TestContext) {
   facts.sessions = [session]
   facts.agents = [{ id: session.id, cwd: workspace, status: 'running' }]
   let delegates = 0
+  let factsFailure = false
   const taskManager = await createTaskManager({store,ctx:{get:()=>undefined},run:async input=>{
     delegates++
     return {status:'completed',sessionId:input.sessionId!,text:'done'}
   }})
   const server = createDeviceLinkServer({ config: { port: 0, bindAddress: '127.0.0.1' }, store, pairing: createPairing(),
     proxy: { handle(_req, res) { res.end('GUI') }, handleUpgrade(_req, socket) { socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n') } },
-    factsProvider: async () => facts,
+    factsProvider: async () => { if (factsFailure) throw new Error('host directory unavailable'); return facts },
     sessionProvider: async (id, scope) => {
       const content = sessionContents.get(id)
       if (!content) throw new HttpError(404, 'session is unavailable')
@@ -55,7 +56,7 @@ async function harness(t: TestContext) {
     const grant = server.openPairing({ relationship: 'same-account', scope })
     return connector.claim(base, grant.code)
   }
-  return { home, workspace, store, local, server, base, connector, pair, session, sessionContents, facts, get delegates() { return delegates } }
+  return { home, workspace, store, local, server, base, connector, pair, session, sessionContents, facts, failFacts() { factsFailure = true }, get delegates() { return delegates } }
 }
 
 async function archivedHarness(t: TestContext) {
@@ -64,6 +65,12 @@ async function archivedHarness(t: TestContext) {
   h.sessionContents.set(archived.id, archived)
   h.facts.sessions = Array.from({ length: 200 }, (_, i) => ({ ...h.session, id: `recent-${i}` }))
   return { ...h, archived }
+}
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>(ready => { resolve = ready })
+  return { promise, resolve }
 }
 
 test('renames sync in both directions without changing grants and survive offline restart', async t => {
@@ -138,6 +145,24 @@ test('new grants require explicit file and tool permissions', () => {
     }
   }
   assert.equal(normalizeScope({ ...defaultScope('different-account'), sessionTools: true }).sessionTools, false)
+  for (const sessionSync of [['none'], ['metadata'], ['content']]) {
+    assert.throws(() => normalizeScope({ ...defaultScope('different-account'), sessionSync }), /invalid sessionSync/)
+  }
+})
+
+test('empty data grants do not consult unauthorized workspace or session services', async () => {
+  const base = { ...defaultScope('different-account'), sessionSync: 'content' as const }
+  for (const scope of [base, { ...base, workspaces: 'all' as const, sessionIds: [] }, { ...base, workspaces: 'all' as const, sessionSync: 'none' as const }]) {
+    const host = await collectHostFacts({ get(name) {
+      if (name === 'sessions' || name === 'sessionController' || name === 'agents' || name === 'workspaceRegistry' && scope.workspaces !== 'all') {
+        throw new Error(`unauthorized data service was consulted: ${name}`)
+      }
+      return undefined
+    } }, { scope })
+    assert.deepEqual(host.workspaces, [])
+    assert.deepEqual(host.sessions, [])
+    assert.deepEqual(host.agents, [])
+  }
 })
 
 test('status responses must carry the current permission fields', async t => {
@@ -373,6 +398,66 @@ test('a slow transcript cannot hold online status or erase cached data while syn
   assert.ok(connector.cachedView(peer).cachedSessionIds.includes('s1'))
 })
 
+test('concurrent status and full sync callers retain independent body waiting requirements', async t => {
+  for (const fullFirst of [false, true]) await t.test(fullFirst ? 'full first' : 'status first', async t => {
+    const h = await harness(t)
+    const peer = await h.pair()
+    const statusGate = deferred()
+    const statusStarted = deferred()
+    const bodyGate = deferred()
+    const bodyStarted = deferred()
+    const connector = createConnector({ store: h.local, log: { warn() {} }, fetchImpl: async (url, options) => {
+      if (String(url).endsWith('/dl/status')) { statusStarted.resolve(); await statusGate.promise }
+      if (String(url).includes('/dl/session?')) { bodyStarted.resolve(); await bodyGate.promise }
+      return fetch(url, options)
+    } })
+    const first = connector.sync(peer, true, fullFirst)
+    await statusStarted.promise
+    const second = connector.sync(peer, true, !fullFirst)
+    const full = fullFirst ? first : second
+    const light = fullFirst ? second : first
+    let fullFinished = false
+    void full.then(() => { fullFinished = true })
+    statusGate.resolve()
+    try {
+      await bodyStarted.promise
+      const view = await Promise.race([light, new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('status waited for transcript')), 1000)
+        timer.unref()
+        void light.finally(() => clearTimeout(timer))
+      })])
+      assert.equal(view.online, true)
+      assert.equal(fullFinished, false, 'full sync finished before the body was cached')
+    } finally { bodyGate.resolve(); await Promise.all([first, second]) }
+    assert.equal(connector.cachedSession(peer, 's1').session.messages[0].text, 'offline reference text')
+  })
+})
+
+test('a queued status update cannot restore a body removed before its cache commit', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  await h.connector.sync(peer, true)
+  const committing = deferred()
+  const commitGate = deferred()
+  const connector = createConnector({ store: { ...h.local, async update(mutate) {
+    committing.resolve()
+    await commitGate.promise
+    return h.local.update(mutate)
+  } }, log: { warn() {} }, fetchImpl: async (url, options) => {
+    if (String(url).includes('/dl/session?')) throw new Error('connection lost')
+    return fetch(url, options)
+  } })
+  const syncing = connector.sync(peer, true)
+  await committing.promise
+  try {
+    h.sessionContents.delete('s1')
+    await assert.rejects(() => h.connector.fetchSession(peer, 's1'), { status: 404 })
+  }
+  finally { commitGate.resolve() }
+  await syncing
+  assert.throws(() => connector.cachedSession(peer, 's1'), { status: 404 })
+})
+
 test('directory omissions revalidate cached bodies: network retains, 404 removes, 403 clears the peer', async t => {
   for (const outcome of ['network', 'missing', 'denied'] as const) await t.test(outcome, async t => {
     const h = await archivedHarness(t)
@@ -528,4 +613,41 @@ test('sync replaces invalid cached evidence with an authorized fresh read', asyn
     assert.deepEqual(repaired.session.evidence, h.archived.evidence)
     assert.notEqual(repaired.cachedAt, '2026-01-01T00:00:00.000Z')
   }
+})
+
+test('task reads and cancellation do not depend on host directory availability', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  const task = await h.connector.startTask(peer,{requestId:'independent',workspacePath:h.workspace,task:'hello'})
+  h.failFacts()
+  assert.equal((await h.connector.readTask(peer,task.id)).id,task.id)
+  assert.equal((await h.connector.cancelTask(peer,task.id)).task?.id,task.id)
+  await h.server.setScope(h.local.state().identity.deviceId,{...defaultScope('same-account'),allowDelegate:false})
+  await assert.rejects(()=>h.connector.readTask(peer,task.id),/not found/)
+})
+
+test('transcripts, task creation and execution context do not depend on the host directory', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  h.failFacts()
+  const content = await fetch(`${h.base}/dl/session?id=s1`, { headers: { authorization: `Bearer ${peer.token}` } })
+  assert.equal(content.status, 200)
+  assert.equal((await content.json()).session.id, 's1')
+  assert.equal((await h.connector.execution(peer, h.workspace, 's1')).selected.model, 'm')
+  assert.equal((await h.connector.startTask(peer, { requestId: 'without-directory', workspacePath: h.workspace, sessionId: 's1', task: 'hello' })).id, 'without-directory')
+  await h.server.setScope(h.local.state().identity.deviceId, { ...defaultScope('same-account'), allowUi: false, workspaces: [] })
+  assert.equal((await fetch(`${h.base}/dl/session?id=s1`, { headers: { authorization: `Bearer ${peer.token}` } })).status, 403)
+  await assert.rejects(() => h.connector.execution(peer, h.workspace, 's1'), { status: 403 })
+})
+
+test('native session access is single use and retains full UI scope enforcement', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  const access = await h.connector.access(peer,'delegate-test')
+  const enter = await fetch(access.url,{redirect:'manual'})
+  assert.equal(enter.headers.get('location'),'/?deviceLinkSession=delegate-test')
+  assert.equal((await fetch(access.url,{redirect:'manual'})).status,401)
+  await assert.rejects(()=>h.connector.access(peer,'//foreign/path'),/invalid sessionId/)
+  await h.server.setScope(h.local.state().identity.deviceId,{...defaultScope('same-account'),allowUi:false})
+  await assert.rejects(()=>h.connector.access(peer,'delegate-test'),/outside the grant/)
 })

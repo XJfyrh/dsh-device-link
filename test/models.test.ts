@@ -41,8 +41,18 @@ test('archived selection separates adapter defaults from explicit next-prompt ch
   assert.deepEqual(eventSelection([{ ...header, data: { header: { config: chosen } } }]), chosen)
   const pending: HostEvent = { seq: 2, type: 'model/selection', data: chosen }
   assert.deepEqual(eventSelection([header, pending]), chosen)
-  assert.deepEqual(eventSelection([pending, { ...header, seq: 3 }]), { provider: chosen.provider, model: chosen.model })
+  assert.deepEqual(eventSelection([pending, { ...header, seq: 3 }]), chosen)
   assert.deepEqual(eventSelection([pending, { seq: 3, type: 'request/header', data: { header: { config: defaultModel } } }]), chosen)
+})
+
+test('archived model selection retires an applied default-effort choice before a later model request', () => {
+  const selected = { provider: chosen.provider, model: chosen.model }
+  const events: HostEvent[] = [
+    { seq: 0, type: 'model/selection', data: selected },
+    { seq: 1, type: 'request/header', data: { header: { config: chosen, adapterDefaults: { reasoningEffort: true } } } },
+    { seq: 2, type: 'request/header', data: { header: { config: defaultModel } } },
+  ]
+  assert.deepEqual(eventSelection(events), defaultModel)
 })
 test('durable titles and request identities survive history projection',async()=>{
   const f=fixture()

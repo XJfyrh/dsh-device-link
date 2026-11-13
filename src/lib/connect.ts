@@ -19,7 +19,7 @@ export function sessionInScope(session: { id: string; cwd: string }, status: Rem
 }
 
 export function createConnector({ store, fetchImpl = globalThis.fetch, log = console }: { store: Store; fetchImpl?: typeof fetch; log?: Logger }) {
-  const pending = new Map<string, Promise<PeerView>>()
+  const pending = new Map<string, Promise<{ view: PeerView; content?: Promise<void> }>>()
   const views = new Map<string, { at: number; view: PeerView }>()
   const contentJobs = new Map<string, Promise<void>>()
   async function request<T>(baseUrl: string, route: string, { token, body, timeoutMs = 4000 }: { token?: string; body?: unknown; timeoutMs?: number } = {}): Promise<T> {
@@ -130,18 +130,12 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     contentJobs.set(peer.deviceId, operation)
     return operation
   }
-  async function refresh(peer: Peer, waitForContent: boolean): Promise<PeerView> {
+  async function refresh(peer: Peer): Promise<{ view: PeerView; content?: Promise<void> }> {
     try {
       const status = await facts(peer)
       const sessions: Record<string, CachedSession> = Object.create(null) as Record<string, CachedSession>
       const previous = store.state().peers[peer.deviceId]?.cache?.sessions ?? {}
-      if (status.scope.sessionSync === 'content') {
-        const listed = new Map(status.host.sessions.map(session => [session.id, session]))
-        for (const session of Object.values(previous)) {
-          const fact = listed.get(session.id)
-          if (hasCurrentEvidence(session) && sessionInScope(session, status) && (!fact || fact.cwd === session.cwd)) sessions[session.id] = authorizedContent(session, status)
-        }
-      }
+      const listed = new Map(status.host.sessions.map(session => [session.id, session]))
       const syncedAt = new Date().toISOString()
       await store.update(draft => {
         const current = draft.peers[peer.deviceId]
@@ -149,37 +143,46 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
         current.name = status.device.name
         current.lastSeenAt = syncedAt
         for (const session of Object.values(current.cache?.sessions ?? {})) {
-          const fact = status.host.sessions.find(item => item.id === session.id)
+          const fact = listed.get(session.id)
           if (hasCurrentEvidence(session) && sessionInScope(session, status) && (!fact || fact.cwd === session.cwd)) sessions[session.id] = authorizedContent(session, status)
         }
         current.cache = { status, syncedAt, sessions }
       })
       views.set(peer.deviceId, { at: Date.now(), view: viewOf(store.state().peers[peer.deviceId] ?? peer, true) })
-      const content = syncContent(peer, status, previous, waitForContent)
-      if (waitForContent) await content
-      else void content.catch(error => log.warn?.(`session sync: ${errorMessage(error)}`))
+      const content = syncContent(peer, status, previous, true)
+      void content.catch(error => log.warn?.(`session sync: ${errorMessage(error)}`))
       const current = store.state().peers[peer.deviceId]
       if (!current || current.token !== peer.token) throw new HttpError(404, 'device disconnected during sync')
       if (!current.cache) throw new HttpError(403, '设备授权已变更')
-      return viewOf(current, true)
+      return { view: viewOf(current, true), content }
     } catch (error) {
       if (error instanceof HttpError && [401, 403].includes(error.status)) {
         await store.update(draft => {
           if (draft.peers[peer.deviceId]?.token === peer.token) delete draft.peers[peer.deviceId].cache
         })
       }
-      return viewOf(store.state().peers[peer.deviceId] ?? { ...peer, cache: undefined }, false, errorMessage(error))
+      return { view: viewOf(store.state().peers[peer.deviceId] ?? { ...peer, cache: undefined }, false, errorMessage(error)) }
     }
   }
   async function sync(peer: Peer, force = false, waitForContent = true): Promise<PeerView> {
     const cached = views.get(peer.deviceId)
-    if (!force && cached && Date.now() - cached.at < 15_000) return cachedView(peer)
-    const existing = pending.get(peer.deviceId)
-    if (existing) return existing
-    const operation = refresh(peer, waitForContent).then(view => { views.set(peer.deviceId, { at: Date.now(), view }); return view })
-      .finally(() => pending.delete(peer.deviceId))
-    pending.set(peer.deviceId, operation)
-    return operation
+    let result: { view: PeerView; content?: Promise<void> }
+    if (!force && cached && Date.now() - cached.at < 15_000) result = { view: cachedView(peer), content: contentJobs.get(peer.deviceId) }
+    else {
+      let operation = pending.get(peer.deviceId)
+      if (!operation) {
+        operation = refresh(peer).then(result => { views.set(peer.deviceId, { at: Date.now(), view: result.view }); return result })
+          .finally(() => pending.delete(peer.deviceId))
+        pending.set(peer.deviceId, operation)
+      }
+      result = await operation
+    }
+    if (!waitForContent || !result.content) return result.view
+    await result.content
+    const current = store.state().peers[peer.deviceId]
+    const latest = views.get(peer.deviceId)?.view ?? result.view
+    return current?.token === peer.token ? viewOf(current, latest.online && Boolean(current.cache), latest.probeError ?? undefined)
+      : viewOf({ ...peer, cache: undefined }, false, 'device disconnected during sync')
   }
   function cachedView(peer: Peer): PeerView {
     const cached = views.get(peer.deviceId)
@@ -235,8 +238,8 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     views.set(peer.deviceId, { at: Date.now(), view: viewOf(store.state().peers[peer.deviceId] ?? peer, true) })
     return cachedSession(peer, id)
   }
-  async function access(peer: Peer) {
-    const payload = await request<{ url: string; expiresAt: string }>(peer.baseUrl, '/dl/access', { token: peer.token, body: {} })
+  async function access(peer: Peer, sessionId?: string) {
+    const payload = await request<{ url: string; expiresAt: string }>(peer.baseUrl, '/dl/access', { token: peer.token, body: { sessionId } })
     const url = new URL(payload.url)
     if (url.origin !== new URL(normalizeBase(peer.baseUrl)).origin || url.pathname !== '/dl/enter' || !url.searchParams.get('ac')) throw new HttpError(502, 'invalid device access URL')
     return payload
@@ -256,6 +259,8 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     if (!task || task.id !== id || typeof task.sessionId !== 'string' || typeof task.workspacePath !== 'string'
       || typeof task.prompt !== 'string' || typeof task.text !== 'string' || typeof task.updatedAt !== 'string'
       || !['queued', 'running', 'stopping', 'completed', 'error', 'stopped', 'interrupted'].includes(task.status)) throw new HttpError(502, 'invalid delegated task response')
+    if (task.pendingInput && (!['approval', 'question'].includes(task.pendingInput.kind)
+      || task.pendingInput.reason !== undefined && typeof task.pendingInput.reason !== 'string')) throw new HttpError(502, 'invalid pending input response')
     return task
   }
   return { claim, facts, sync, cachedView, peerByRef, cachedSession, fetchSession, access, revoke,
@@ -314,7 +319,7 @@ export interface PeerView {
   lastSeenAt: string
   cachedAt: string | null
   cachedSessionIds: string[]
-  sessionCache?: Record<string, 'content' | 'tasks' | 'empty'>
+  sessionCache: Record<string, 'content' | 'tasks' | 'empty'>
   status: RemoteStatus | null
   update: ReturnType<typeof updateStatus>
   probeError: string | null

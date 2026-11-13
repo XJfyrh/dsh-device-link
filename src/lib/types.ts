@@ -1,4 +1,4 @@
-export const APP_VERSION = '0.5.1'
+export const APP_VERSION = '0.5.2'
 export const API_VERSION = 'v2'
 
 export type WorkspaceScope = 'all' | string[]
@@ -82,6 +82,7 @@ export interface State {
 }
 export interface FavoriteWorkspace { deviceId: string; path: string; title: string }
 export type TaskStatus = 'queued' | 'running' | 'stopping' | 'completed' | 'error' | 'stopped' | 'interrupted'
+export interface PendingInput { kind: 'approval' | 'question'; reason?: string; toolName?: string; since?: number }
 export interface DeviceTask {
   id: string
   sessionId: string
@@ -98,6 +99,7 @@ export interface DeviceTask {
   reasoningEffort?: string
   selection?: ModelSelection
   promptRequestId?: string
+  pendingInput?: PendingInput
 }
 export interface StoredTask extends DeviceTask {
   ownerDeviceId: string
@@ -150,6 +152,7 @@ export interface DelegateResult {
   sessionId: string
   text: string
   error?: string
+  errorPhase?: 'startup' | 'execution'
   cancelled?: boolean
 }
 export function errorMessage(error: unknown): string {

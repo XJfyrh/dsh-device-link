@@ -12,7 +12,7 @@ import { renameDevice } from './identity.js'
 export async function statePayload(runtime: Runtime) {
   const { server, connector, store, hostFacts } = runtime
   const peers = Object.values(store.state().peers).map(peer => {
-    void connector.sync(peer, false, false)
+    void connector.sync(peer, false, false).catch(error => console.warn('[device-link] status sync', error))
     return connector.cachedView(peer)
   })
   return { ok: true as const, ...server.info(), identity: store.state().identity, pairing: server.pairingCode(),
@@ -72,7 +72,7 @@ export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntim
       default: {
         const peer = connector.peerByRef(String(body.deviceId ?? ''))
         if (!peer) throw new HttpError(404, '没有这个设备')
-        if (route === 'open') result = await connector.access(peer)
+        if (route === 'open') result = await connector.access(peer, typeof body.sessionId === 'string' ? body.sessionId : undefined)
         else if (route === 'execution') result = await connector.execution(peer, String(body.workspacePath ?? ''), typeof body.sessionId === 'string' ? body.sessionId : undefined)
         else if (route === 'task-start') result = { task: await outgoingTasks.start(peer, {
           id: String(body.id ?? ''), workspacePath: String(body.workspacePath ?? ''), task: String(body.task ?? ''),

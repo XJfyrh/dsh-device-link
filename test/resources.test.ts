@@ -31,6 +31,7 @@ test('empty resource results distinguish an empty directory, excluded files and 
   assert.equal(empty.truncated, false)
   await fs.writeFile(path.join(root, '.env'), 'private')
   assert.equal((await provider(input, scope)).emptyReason, 'no-readable-files')
+  assert.equal((await provider({ ...input, action: 'search', query: 'not-present' }, scope)).emptyReason, 'no-readable-files')
   await fs.writeFile(path.join(root, 'source.ts'), 'export const answer = 42')
   assert.equal((await provider({ ...input, action: 'search', query: 'not-present' }, scope)).emptyReason, 'no-matches')
   await assert.rejects(provider(input, { ...scope, allowReadFiles: false }), { status: 403 })
@@ -95,6 +96,21 @@ test('each session query uses one source observation and enforces explicit tool-
   await assert.rejects(() => provider(request, { ...scope, sessionIds: [] }), { status: 403 })
   h.events[2].data.message = { content: 'different failure' }
   await assert.rejects(() => provider({ ...request, action: 'read', seq: 2, revision: found.items[0].revision }, { ...scope, sessionTools: true }), { status: 409 })
+})
+
+test('resource reads distinguish missing sessions and events from host persistence failures', async t => {
+  const root = await temporary(t)
+  const h = sessionHarness(root)
+  const query = h.ctx.get('sessionQuery')!
+  let failure = Object.assign(new Error('session not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+  query.readSession = query.readEvent = async () => { throw failure }
+  const provider = createResourceProvider(h.ctx)
+  const input: ResourceRequest = { kind: 'session', workspacePath: root, sessionId: 's1', action: 'inspect' }
+  await assert.rejects(() => provider(input, defaultScope('same-account')), { status: 404 })
+  failure = Object.assign(new Error('event not found'), { code: 'SESSION_QUERY_EVENT_NOT_FOUND' })
+  await assert.rejects(() => provider({ ...input, action: 'read', seq: 999, revision: 'a'.repeat(64) }, defaultScope('same-account')), { status: 404 })
+  failure = Object.assign(new Error('disk read failed'), { code: 'SESSION_QUERY_PERSISTENCE_FAILED' })
+  await assert.rejects(() => provider(input, defaultScope('same-account')), error => error === failure)
 })
 
 test('file reads preserve empty lines and include separators in the page size limit', async t => {

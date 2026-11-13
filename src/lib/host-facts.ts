@@ -18,13 +18,14 @@ function timestamp(value: unknown): number {
 }
 
 export async function collectHostFacts(ctx: Pick<HostContext, 'get'>, { scope, startedAt = Date.now() }: { scope?: Scope; startedAt?: number } = {}): Promise<HostFacts> {
-  const workspaces = (ctx.get('workspaceRegistry')?.list() ?? [])
+  const workspaceAccess = !scope || scope.workspaces === 'all' || scope.workspaces.length > 0
+  const sessionAccess = workspaceAccess && (!scope || scope.sessionSync !== 'none' && (scope.sessionIds === 'all' || scope.sessionIds.length > 0))
+  const workspaces = (workspaceAccess ? ctx.get('workspaceRegistry')?.list() ?? [] : [])
     .filter(item => isPathAllowed(item.path, scope?.workspaces))
     .map(item => ({ id: item.id, path: item.path, title: item.title }))
-  const live = ctx.get('sessions')?.list() ?? []
   const sessions = new Map<string, SessionFact>()
-  const controller = ctx.get('sessionController')
-  if (controller && scope?.sessionSync !== 'none') {
+  const controller = sessionAccess ? ctx.get('sessionController') : undefined
+  if (controller) {
     // The host list reads persisted projections, never folds every archived log.
     const { items } = await controller.list({}, AbortSignal.timeout(4000))
     for (const item of items) {
@@ -33,16 +34,16 @@ export async function collectHostFacts(ctx: Pick<HostContext, 'get'>, { scope, s
       if (!scope || sessionAllowed(fact, scope)) sessions.set(fact.id, fact)
     }
   }
-  for (const session of controller ? [] : live) {
+  for (const session of sessionAccess && !controller ? ctx.get('sessions')?.list() ?? [] : []) {
     if (scope && !sessionAllowed({ id: session.id, cwd: session.header.cwd ?? '' }, scope)) continue
     sessions.set(session.id, sessionFact(session.id, session.header.cwd ?? '', session.snapshotEvents(), true, timestamp(session.updatedAt ?? session.header.createdAt), session.title))
   }
-  const agents = (ctx.get('agents')?.list() ?? [])
-    .filter(agent => isPathAllowed(agent.session.header.cwd, scope?.workspaces) && (!scope || sessionAllowed({ id: agent.id, cwd: agent.session.header.cwd ?? '' }, scope)))
+  const agents = (sessionAccess ? ctx.get('agents')?.list() ?? [] : [])
+    .filter(agent => scope ? sessionAllowed({ id: agent.id, cwd: agent.session.header.cwd ?? '' }, scope) : isPathAllowed(agent.session.header.cwd))
     .map(agent => ({ id: agent.id, title: sessions.get(agent.id)?.title ?? '新会话', cwd: agent.session.header.cwd ?? '', status: agent.status, model: agent.options.model, provider: agent.options.provider }))
   return {
     platform: process.platform, arch: process.arch, hostname: os.hostname(), node: process.version, startedAt,
-    workspaces, sessions: [...sessions.values()].filter(session => !scope || sessionAllowed(session, scope)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 200),
+    workspaces, sessions: [...sessions.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 200),
     agents, model: ctx.get('agentDefaultModel')?.currentSelection() ?? {},
   }
 }

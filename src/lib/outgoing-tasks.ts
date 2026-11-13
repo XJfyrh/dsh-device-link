@@ -98,7 +98,7 @@ export function createOutgoingTasks({ store, connector }: { store: Store; connec
     while (Date.now() < deadline) {
       if (signal?.aborted) return cancel(id)
       const task = await refresh(id)
-      if (task.submission === 'failed' || task.submission === 'cancelled' || (task.remote && !activeTask(task.remote))) return task
+      if (task.submission === 'failed' || task.submission === 'cancelled' || (task.remote && (!activeTask(task.remote) || task.remote.pendingInput && !task.connectionError))) return task
       try { await delay(800, undefined, { signal }) } catch { if (signal?.aborted) return cancel(id) }
     }
     return get(id)

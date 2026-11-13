@@ -31,9 +31,9 @@ export async function api<T>(route: string, body?: unknown, signal?: AbortSignal
   return payload
 }
 export function message(error: unknown): string { return error instanceof Error ? error.message : String(error) }
-export async function openDeviceUi(deviceId: string): Promise<void> {
+export async function openDeviceUi(deviceId: string, sessionId?: string): Promise<void> {
   if (window.location.protocol === 'dsh-app:') {
-    const { url } = await api<{ url: string }>('open', { deviceId })
+    const { url } = await api<{ url: string }>('open', { deviceId, sessionId })
     // Electron forwards HTTP(S) to the system browser and intentionally returns null.
     window.open(url, '_blank', 'noopener,noreferrer')
     return
@@ -41,7 +41,7 @@ export async function openDeviceUi(deviceId: string): Promise<void> {
   const tab = window.open('about:blank', '_blank')
   if (!tab) throw new Error('请允许弹窗后重试')
   tab.opener = null
-  try { tab.location.href = (await api<{ url: string }>('open', { deviceId })).url }
+  try { tab.location.href = (await api<{ url: string }>('open', { deviceId, sessionId })).url }
   catch (error) { tab.close(); throw error }
 }
 export function requestId(): string {
@@ -51,7 +51,7 @@ export function active(task: OutgoingTask): boolean {
   return task.remote ? ['queued', 'running', 'stopping'].includes(task.remote.status) : task.submission === 'pending'
 }
 export function cacheLabel(peer: PeerView | undefined, sessionId: string): string {
-  const state = peer?.sessionCache?.[sessionId]
+  const state = peer?.sessionCache[sessionId]
   return state === 'content' ? '已缓存正文' : state === 'tasks' ? '任务记录可读' : state === 'empty' ? '暂无正文' : '仅会话目录'
 }
 export function reference(resource: Resource): Reference {
@@ -199,18 +199,25 @@ export function createClientState(ctx: ClientContext) {
     await refresh()
     if (!controller.signal.aborted) timer = setTimeout(() => void poll(), view.data?.peers.some(peer => peer.checking) ? 1500 : 10_000)
   }
+  let taskRefresh: Promise<unknown> | undefined
+  function refreshActiveTasks(): Promise<unknown> {
+    return taskRefresh ??= Promise.allSettled(view.tasks.filter(task => active(task) || task.cancelRequested).map(task => localTasks[task.id] ? sendLocal(task.id) : refreshTask(task.id)))
+      .finally(() => { taskRefresh = undefined })
+  }
   async function pollTasks() {
     if (controller.signal.aborted) return
-    await Promise.allSettled(view.tasks.filter(task => active(task) || task.cancelRequested).map(task => localTasks[task.id] ? sendLocal(task.id) : refreshTask(task.id)))
+    await refreshActiveTasks()
     if (!controller.signal.aborted) taskTimer = setTimeout(() => void pollTasks(), 2500)
   }
   function newerTask(task: OutgoingTask): OutgoingTask {
     const current = view.tasks.find(item => item.id === task.id)
-    return current?.remote && (!task.remote || current.remote.updatedAt > task.remote.updatedAt) ? current : task
+    return current?.remote && (!task.remote || current.remote.updatedAt > task.remote.updatedAt
+      || current.remote.updatedAt === task.remote.updatedAt && (current.checkedAt ?? '') > (task.checkedAt ?? '')) ? current : task
   }
   function putTask(task: OutgoingTask) {
     task = newerTask(task)
     change({ tasks: [task, ...view.tasks.filter(item => item.id !== task.id)].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) })
+    return task
   }
   function sendLocal(id: string): Promise<OutgoingTask> {
     const existing = submissions.get(id)
@@ -221,16 +228,14 @@ export function createClientState(ctx: ClientContext) {
       sessionId: task.resumeSessionId, originSessionId: task.originSessionId, selection: task.selection })
       .then(async result => {
         if (localTasks[id]?.cancelRequested) result = await api<{ task: OutgoingTask }>('task-cancel', { id })
-        const confirmed = view.tasks.find(task => task.id === id)
-        if (confirmed?.remote && (!result.task.remote || Date.parse(confirmed.remote.updatedAt) > Date.parse(result.task.remote.updatedAt))) result = { task: confirmed }
-        delete localTasks[id]; persist(); putTask(result.task); return result.task
+        delete localTasks[id]; persist(); return putTask(result.task)
       })
       .catch(cause => {
         // Polling may confirm delivery before this older submission loses its response.
         const confirmed = !localTasks[id] && view.tasks.find(task => task.id === id)
         if (confirmed) return confirmed
         const failed = { ...task, connectionError: message(cause), submission: cause instanceof ApiError && cause.status >= 400 && cause.status < 500 ? 'failed' as const : 'pending' as const }
-        localTasks[id] = failed; persist(); putTask(failed); return failed
+        localTasks[id] = failed; persist(); return putTask(failed)
       }).finally(() => submissions.delete(id))
     submissions.set(id, operation)
     return operation
@@ -245,10 +250,10 @@ export function createClientState(ctx: ClientContext) {
     setDraft(resource, { ...draft, text: '' })
     return sendLocal(task.id)
   }
-  async function refreshTask(id: string) { const result = await api<{ task: OutgoingTask }>('task-refresh', { id }, controller.signal); putTask(result.task); return result.task }
+  async function refreshTask(id: string) { const result = await api<{ task: OutgoingTask }>('task-refresh', { id }, controller.signal); return putTask(result.task) }
   async function cancelTask(id: string) {
     if (localTasks[id]) { localTasks[id].cancelRequested = true; persist(); putTask(localTasks[id]); return sendLocal(id) }
-    const result = await api<{ task: OutgoingTask }>('task-cancel', { id }, controller.signal); putTask(result.task); return result.task
+    const result = await api<{ task: OutgoingTask }>('task-cancel', { id }, controller.signal); return putTask(result.task)
   }
   function preview(resource: Resource) {
     change({ panel: null })
@@ -306,7 +311,12 @@ export function createClientState(ctx: ClientContext) {
     saveScroll(resource: Resource, top: number) { scrolls[draftKey(resource)] = top; clearTimeout(scrollTimer); scrollTimer = setTimeout(persist, 250) },
     peer(id: string): PeerView | undefined { return view.data?.peers.find(peer => peer.deviceId === id) },
     currentSession: () => ctx.sidebarRight.mounted.getSnapshot(),
-    start() { void poll(); void pollTasks(); return () => { persist(); controller.abort(); clearTimeout(timer); clearTimeout(taskTimer); clearTimeout(toastTimer); clearTimeout(scrollTimer) } },
+    start() {
+      const resume = () => { if (document.visibilityState !== 'hidden' && !controller.signal.aborted) { void refresh(); void refreshActiveTasks() } }
+      window.addEventListener('focus', resume); document.addEventListener('visibilitychange', resume)
+      void poll(); void pollTasks()
+      return () => { window.removeEventListener('focus', resume); document.removeEventListener('visibilitychange', resume); persist(); controller.abort(); clearTimeout(timer); clearTimeout(taskTimer); clearTimeout(toastTimer); clearTimeout(scrollTimer) }
+    },
   }
 }
 export type ClientState = ReturnType<typeof createClientState>

@@ -27,10 +27,15 @@ if (versionProbe.status !== 0 || !actual.length || difference >= 0 && actual[dif
   throw new Error(`DSH ${hostVersion || 'unknown'} 不支持当前插件接口；设置 DSH_CLI 为桌面版同版本（至少 0.2.2-rc.3）的完整入口路径`)
 }
 console.log(`Harness host ${hostVersion}`)
+const protocolOnly = process.argv.includes('--protocol-only')
+const lanFollowupOnly = process.argv.includes('--lan-followup-only')
+const browserEnabled = process.env.E2E_BROWSER === '1'
+const modelConfigured = !protocolOnly && Boolean(process.env.DEEPSEEK_API_KEY?.trim() || process.env.E2E_MODEL_HOME)
+if (lanFollowupOnly && (!browserEnabled || !modelConfigured)) {
+  throw new Error('--lan-followup-only 需要 E2E_BROWSER=1 和模型配置，不能与 --protocol-only 合用')
+}
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'device-link-e2e-'))
 const children: ChildProcess[] = []
-const protocolOnly = process.argv.includes('--protocol-only')
-const modelConfigured = !protocolOnly && Boolean(process.env.DEEPSEEK_API_KEY?.trim() || process.env.E2E_MODEL_HOME)
 const report: { name: string; passed: boolean; durationMs: number; error?: string }[] = []
 let passed = 0
 let failed = 0
@@ -60,9 +65,22 @@ async function start(name: string, listenPort = 0): Promise<Instance> {
   await fs.mkdir(fixturePackage, { recursive: true })
   await fs.mkdir(workspacePath, { recursive: true })
   await fs.writeFile(path.join(fixturePackage, 'package.json'), JSON.stringify({ name: 'device-link-test-workspace', type: 'module', exports: { '.': './index.mjs', './client': './client.js' }, dsh: { client: { platform: 'web', immediately: true } } }))
-  await fs.writeFile(path.join(fixturePackage, 'index.mjs'), `export const inject = ['workspaceController']
+  await fs.writeFile(path.join(fixturePackage, 'index.mjs'), `export const inject = ['workspaceController', 'workspaceRegistry', 'webServer', 'connection', 'tools', 'approval']
 export function apply(ctx, config) {
   void ctx.workspaceController.create({ path: config.path }).catch(error => console.error('Test workspace initialization failed', error))
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/device-link-test/workspaces', async handler(req, res) {
+    const rejection = ctx.connection.requestRejection({headers:req.headers})
+    if (rejection) { res.writeHead(rejection); res.end(); return }
+    res.setHeader('content-type','application/json')
+    res.end(JSON.stringify(ctx.workspaceRegistry.list().map(w => ({id:w.id,path:w.path,sessionIds:[...w.sessionIds]}))))
+  } }))
+  ctx.effect(() => ctx.tools.register({ name:'device_link_test_approval', description:'验收专用：请求一次人工权限处理，不读写文件。',
+    parameters:{type:'object',properties:{},additionalProperties:false}, output:{schema:{type:'object',additionalProperties:true},render:(_args,value)=>[{type:'text',text:JSON.stringify(value)}]},
+    timeoutMs:120000, isConcurrencySafe:()=>false, async execute(_args, execution) {
+      const outcome = await ctx.approval.request({agent:execution.agent,toolName:'device_link_test_approval',callId:execution.callId,reason:'验收权限请求：不执行文件操作',signal:execution.signal})
+      return {outcome}
+    }
+  }))
 }
 `)
   await fs.writeFile(path.join(fixturePackage, 'client.js'), `
@@ -301,8 +319,10 @@ try {
     }
     const remote = await api<DeviceState>(a, 'state')
     assert.ok(remote.host.sessions.some(session => session.id === result.sessionId))
+    const workspaces = await (await fetch(`${a.base}/device-link-test/workspaces`,{headers:{cookie:a.cookie}})).json() as {path:string;sessionIds:string[]}[]
+    assert.ok(workspaces.find(workspace => workspace.path === project)?.sessionIds.includes(result.sessionId), 'delegation must be attached to its registered workspace')
   })
-  if (modelConfigured) {
+  if (modelConfigured && !lanFollowupOnly) {
     await step('scoped remote model reads a fixture and writes a file in its execution workspace', async () => {
       await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: { ...defaultScope('different-account'), workspaces: [executionWorkspace], allowDelegate: true, sessionSync: 'content' } })
       const result = await runTask(b, {
@@ -345,7 +365,7 @@ try {
       assert.match(read.result.items[0].text!, /401/)
     })
   }
-  if (modelConfigured) await step('persistent tasks survive polling retries and continue the same remote session', async () => {
+  if (modelConfigured && !lanFollowupOnly) await step('persistent tasks survive polling retries and continue the same remote session', async () => {
     const id = crypto.randomUUID()
     const input = { id, deviceId: peerId, workspacePath: executionWorkspace, task: '只回复 PERSISTENT_TASK_OK。' }
     const first = await api<{ task: OutgoingTask }>(b, 'task-start', input)
@@ -373,8 +393,10 @@ try {
     const saved = await api<{ tasks: OutgoingTask[] }>(b, 'tasks')
     assert.equal(saved.tasks.find(task => task.id === id)?.remote?.status, 'completed')
   })
-  if (process.env.E2E_BROWSER === '1') {
-    await step('device panel, favorites, reference chips, task cards, settings and offline preview', async () => {
+  if (browserEnabled) {
+    await step(lanFollowupOnly ? 'incoming authorization management and native approval decisions'
+      : modelConfigured ? 'device panel, approvals, favorites, reference chips, task cards, settings and offline preview'
+        : 'device panel, incoming grants, favorites, reference chips and settings', async () => {
       const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH })
       let page: Page | undefined
       const errors: string[] = []
@@ -409,7 +431,12 @@ try {
         const pairingCode = (await page.locator('.code').innerText()).trim()
         const aPage = await open(a)
         await aPage.getByRole('button', { name: '设备', exact: true }).click()
-        await expect(aPage.locator('.dl-popover .empty')).toContainText('连接另一台设备，访问它的工作区')
+        await expect(aPage.getByRole('region', {name:'已授权连接本机'})).toContainText('harness-b')
+        await expect(aPage.locator('.device-trigger')).toContainText('已授权 1 台')
+        await aPage.getByRole('region', {name:'已授权连接本机'}).getByRole('button', {name:/harness-b/}).click()
+        await expect(aPage.locator('.dl-popover')).toContainText('全部工作区')
+        await capture(aPage, 'incoming-authorization')
+        await aPage.getByRole('button', {name:'设备列表',exact:true}).click()
         await expect(aPage.locator('.dl-popover').getByRole('button', { name: /连接设备/ })).toHaveCount(1)
         await aPage.getByRole('button', { name: '＋ 连接设备', exact: true }).click()
         await aPage.getByLabel('设备地址', { exact: true }).fill(`http://${listenB.host}:${listenB.port}`)
@@ -426,6 +453,37 @@ try {
         await capture(popup, 'proxied-harness')
         await popup.close()
         await page.getByRole('button', { name: '关闭设备面板', exact: true }).click()
+        if (modelConfigured) {
+          for (const outcome of ['allowed-once', 'rejected'] as const) {
+            const id = crypto.randomUUID()
+            await api(b, 'task-start', {id,deviceId:peerId,workspacePath:path.join(a.home,'workspace'),task:'调用一次 device_link_test_approval 工具，等待人工决定。不要调用其他工具或重试。完成后只回复工具返回的 outcome 原文。'})
+            await expect.poll(async () => (await api<{task:OutgoingTask}>(b,'task-refresh',{id})).task.remote?.pendingInput?.kind, {timeout:60000,intervals:[500]}).toBe('approval')
+            await page.getByRole('button',{name:'设备任务',exact:true}).click()
+            const card = page.locator(`[data-task-id="${id}"]`)
+            await expect(card).toContainText('等待权限处理', {timeout:15000})
+            await card.getByRole('button').click()
+            await expect(page.locator('.dl-pending-input')).toContainText('验收权限请求：不执行文件操作')
+            await capture(page, `approval-${outcome}-waiting`)
+            const [approvalPage] = await Promise.all([page.waitForEvent('popup'),page.getByRole('button',{name:'打开 harness-a 的会话处理',exact:true}).click()])
+            approvalPage.setDefaultTimeout(15000)
+            const notice = approvalPage.getByRole('dialog',{name:'预览版说明',exact:true})
+            await notice.waitFor({timeout:3000}).then(()=>notice.getByRole('button',{name:'继续',exact:true}).click()).catch(error=>{if (error.name !== 'TimeoutError') throw error})
+            try { await expect(approvalPage.locator('[data-approval-key]')).toContainText('验收权限请求：不执行文件操作', {timeout:15000}) }
+            catch (error) { await capture(approvalPage,'approval-navigation-failure'); console.log('Approval navigation URL',approvalPage.url()); throw error }
+            await capture(approvalPage, `approval-${outcome}-native`)
+            await approvalPage.locator('[data-approval-key]').getByRole('button',{name:outcome === 'allowed-once' ? '允许一次' : '拒绝',exact:true}).click()
+            await expect.poll(async () => (await api<{task:OutgoingTask}>(b,'task-refresh',{id})).task.remote?.status, {timeout:60000,intervals:[500]}).toBe('completed')
+            const finished = (await api<{task:OutgoingTask}>(b,'task-refresh',{id})).task
+            assert.match(finished.remote!.text,new RegExp(outcome))
+            assert.equal(finished.remote?.pendingInput,undefined)
+            await expect(page.locator('.dl-pending-input')).toHaveCount(0)
+            await approvalPage.close()
+            await page.getByRole('button',{name:'全部任务',exact:true}).click()
+            console.log(`  native approval ${outcome} passed`)
+          }
+        }
+        if (lanFollowupOnly) { assert.deepEqual(errors, []); return }
+        if (modelConfigured) await page.getByRole('treeitem',{name:'新会话',exact:true}).click()
         await page.getByRole('button', { name: '设备', exact: true }).click()
         await page.getByRole('button', { name: /harness-a.*在线/ }).click()
         await page.getByRole('button', { name: '收藏 workspace', exact: true }).click()
@@ -638,6 +696,15 @@ try {
       }
     })
   }
+  await step('all newly delegated sessions belong to their execution workspaces', async () => {
+    for (const instance of [a,b]) {
+      const saved = JSON.parse(await fs.readFile(path.join(instance.home,'device-link','devices-v2.json'),'utf8')) as {incomingTasks:Record<string,{resume:boolean;sessionId:string;workspacePath:string;baselineSeq?:number}>}
+      const workspaces = await (await fetch(`${instance.base}/device-link-test/workspaces`,{headers:{cookie:instance.cookie}})).json() as {path:string;sessionIds:string[]}[]
+      for (const task of Object.values(saved.incomingTasks).filter(task=>!task.resume && task.baselineSeq !== undefined)) {
+        assert.ok(workspaces.find(workspace=>workspace.path===task.workspacePath)?.sessionIds.includes(task.sessionId),'new delegated session missing from its execution workspace')
+      }
+    }
+  })
   await step('restricted grants close full UI access and filter session sync', async () => {
     await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: { ...defaultScope('different-account'), workspaces: [project], allowDelegate: true, sessionSync: 'metadata' } })
     assert.equal((await fetch(lanA, { headers: { cookie } })).status, 403)
@@ -664,6 +731,6 @@ try {
   await fs.rm(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
 }
 await fs.mkdir(path.join(project, '.e2e'), { recursive: true })
-await fs.writeFile(path.join(project, '.e2e', 'acceptance.json'), JSON.stringify({ completedAt: new Date().toISOString(), hostVersion, modelConfigured, passed, failed, tests: report }, null, 2))
+await fs.writeFile(path.join(project, '.e2e', 'acceptance.json'), JSON.stringify({ completedAt: new Date().toISOString(), hostVersion, protocolOnly, browserEnabled, lanFollowupOnly, modelConfigured, passed, failed, tests: report }, null, 2))
 console.log(`${passed} passed, ${failed} failed`)
 process.exitCode = failed ? 1 : 0

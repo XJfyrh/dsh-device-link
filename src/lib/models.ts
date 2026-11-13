@@ -20,15 +20,12 @@ export function eventSelection(events: HostEvent[]): ModelSelection | undefined 
     if (event.type === 'request/header') {
       const header = record(event.data.header)
       used = parseSelection(header.config)
-      if (sameSelection(used, pending)) pending = undefined
       // Adapter defaults describe execution, not an explicit choice for the next prompt.
       if (used && record(header.adapterDefaults).reasoningEffort === true) delete used.reasoningEffort
+      if (sameSelection(used, pending)) pending = undefined
     }
   }
   return pending ?? used
-}
-export function currentSelection(_ctx: Pick<HostContext, 'get'>, agent: HostAgent): ModelSelection | undefined {
-  return agent.model.current()
 }
 export async function executionContext(ctx: Pick<HostContext, 'get'>, workspace: string, sessionId?: string): Promise<ExecutionContext> {
   const controller = ctx.get('sessionController')
@@ -41,7 +38,7 @@ export async function executionContext(ctx: Pick<HostContext, 'get'>, workspace:
     const saved = live ? { session: live.header, events: live.snapshotEvents() } : await ctx.get('sessionQuery')?.readSession(sessionId)
     if (!saved) throw new HttpError(404, '设备会话已不存在')
     if (path.resolve(saved.session.cwd ?? '') !== path.resolve(workspace)) throw new HttpError(403, '会话不属于此工作区')
-    selected = (agent ? currentSelection(ctx, agent) : eventSelection(saved.events)) ?? selected
+    selected = (agent ? agent.model.current() : eventSelection(saved.events)) ?? selected
   }
   // Explicit whitelist: provider credentials and host configuration never cross this endpoint.
   return { catalog: { default: catalog.default, groups: catalog.groups.map(group => ({ id: group.id, name: group.name,

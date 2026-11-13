@@ -1,9 +1,9 @@
 import type * as ReactTypes from 'react'
 import type { ClientPrimitives, CreatePortal } from './contracts.js'
-import { api, active, draftKey, message, type ClientState, type Resource, type SessionSnapshot } from './state.js'
+import { api, active, draftKey, message, openDeviceUi, type ClientState, type Resource, type SessionSnapshot } from './state.js'
 import type { ExecutionContext, OutgoingTask } from '../lib/types.js'
 import { relativeTime, shortText, workspaceName } from '../lib/presentation.js'
-import { conversationTurns, statusLabels, taskStatusPresentation } from './conversation.js'
+import { conversationTurns, taskStatusPresentation } from './conversation.js'
 import { createModelPicker } from './model-picker.js'
 import { nativeWhaleRestPath } from './native-running.js'
 import { createDeviceIcon } from './icons.js'
@@ -21,11 +21,13 @@ export function createTaskComponents(React: typeof ReactTypes, state: ClientStat
     }}>{copied ? <CheckIcon size={16} /> : <CopyIcon size={16} />}</button>
   }
   function TaskCard({ task, source = 'tasks' }: { task: OutgoingTask; source?: 'tasks' | 'local' }) {
+    const view = useView()
+    const online = !!view.data?.peers.find(peer => peer.deviceId === task.deviceId)?.online
     return <article className="dl dl-task" data-task-id={task.id}>
       <button className="dl-task-link" onClick={() => state.openTask(task, source)}>
-        <span className="row between"><strong className="ellipsis">{shortText(task.prompt)}</strong><span className="task-state">{statusLabels[task.remote?.status ?? task.submission]}</span></span>
+        <span className="row between"><strong className="ellipsis">{shortText(task.prompt)}</strong><span className="task-state">{taskStatusPresentation(task, online).label}</span></span>
         <small className="dl-meta"><span className="dl-icon-label">{task.deviceName}<ChevronIcon size={12} />{workspaceName(task.workspacePath)}</span><span>{relativeTime(task.remote?.updatedAt ?? task.createdAt)}</span></small>
-        <p className="dl-excerpt">{shortText(task.remote?.text || task.remote?.error || task.connectionError || '打开任务查看进展', 140)}</p>
+        <p className="dl-excerpt">{shortText(task.connectionError || task.remote?.pendingInput?.reason || task.remote?.error || task.remote?.text || '打开任务查看进展', 140)}</p>
         <span className="dl-link dl-icon-label">查看任务<ChevronIcon size={14} /></span>
       </button>
     </article>
@@ -134,12 +136,17 @@ export function createTaskComponents(React: typeof ReactTypes, state: ClientStat
     }
     function turnStatus(task: OutgoingTask) {
       const status = taskStatusPresentation(task, !!peer?.online)
-      return <div className="dl-turn-status" role="status">{status.running ? <span className="dl-running-status">
+      return <div className="dl-turn-status" data-pending={task.remote?.pendingInput && peer?.online && !task.connectionError && !task.cancelRequested ? '' : undefined} role="status">{status.running ? <span className="dl-running-status">
         <span className="dl-running-icon" aria-hidden="true"><span className="dl-running-whale-animated" /><svg className="dl-running-whale-still" width="100%" height="100%" viewBox="0 0 16 16" fill="none"><path d={nativeWhaleRestPath} stroke="currentColor" strokeWidth={1} /></svg></span>
         <TextShimmer active>{status.label}</TextShimmer>
       </span> : <span>{status.label}</span>}
         {task.connectionError && <p>{task.remote ? '暂时无法更新状态，执行设备上的任务可能仍在运行。' : task.submission === 'pending' ? '尚未确认送达，恢复连接后会核对同一次提交。' : task.connectionError}</p>}
         {task.remote?.error && <p className="error">{task.remote.error}</p>}
+        {task.remote?.pendingInput && task.remote.status === 'running' && !task.cancelRequested && !task.connectionError && peer?.online && <div className="dl-pending-input">
+          {task.remote.pendingInput.reason && <p>{task.remote.pendingInput.reason}</p>}
+          {peer.status?.scope.allowUi ? <button className="outline" onClick={() => void openDeviceUi(task.deviceId, task.remote?.sessionId).catch(cause => setError(message(cause)))}>打开 {peer.name} 的会话处理</button>
+            : <p>请在 {peer.name} 上打开此会话处理。</p>}
+        </div>}
         {(task.connectionError || task.remote?.status === 'interrupted') && <button onClick={() => void state.refreshTask(task.id).catch(cause => setError(message(cause)))}>检查状态</button>}
         {(task.submission === 'failed' || ['error', 'stopped', 'interrupted'].includes(task.remote?.status ?? '')) && <button onClick={() => { state.setDraft(resource, { text: task.prompt, selection: task.selection }); input.current?.focus() }}>重新编辑</button>}
       </div>
@@ -200,10 +207,11 @@ export function createTaskComponents(React: typeof ReactTypes, state: ClientStat
   }
   function TasksPage() {
     const view = useView()
+    useEffect(() => { void state.refresh() }, [])
     const [query, setQuery] = useState('')
     if (view.execution) return <Detail key={`${view.execution.deviceId}:${view.execution.sessionId ?? view.execution.workspace}`} resource={view.execution} />
     const tasks = view.tasks.filter(task => `${task.prompt} ${task.deviceName} ${task.workspacePath}`.toLowerCase().includes(query.toLowerCase()))
-    const attention = (task: OutgoingTask) => task.submission === 'failed' || !!task.connectionError || ['error', 'interrupted'].includes(task.remote?.status ?? '')
+    const attention = (task: OutgoingTask) => task.submission === 'failed' || !!task.connectionError || !!task.remote?.pendingInput || ['error', 'interrupted'].includes(task.remote?.status ?? '')
     const groups = [['需要处理', tasks.filter(attention)], ['进行中', tasks.filter(task => active(task) && !attention(task))], ['最近任务', tasks.filter(task => !active(task) && !attention(task))]] as const
     return <main className="dl dl-tasks"><div><header className="row between"><h2>设备任务</h2><button className="primary" onClick={() => state.change({ panel: 'all' })}>新建任务</button></header>
       {view.error && <p className="error" role="alert">{view.error}</p>}

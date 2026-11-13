@@ -12,8 +12,8 @@
 | GUI HTTP 与 WebSocket | `credentials`、`proxy` | `proxy`、`integration` |
 | 身份、状态与缓存 | `identity`、`store`、`connect`、`host-facts` | `identity`、`collaboration`、`host-facts` |
 | 资料引用与读取 | `references`、`resources`、`evidence` | `resources`、`client`、双实例脚本 |
-| 任务与模型 | `tasks`、`outgoing-tasks`、`delegation`、`models` | `tasks`、`host-facts`、`models` |
-| 所有者入口 | `api`、`commands`、`tool` | `commands`、`tool`、双实例脚本 |
+| 任务与模型 | `tasks`、`outgoing-tasks`、`delegation`、`models` | `tasks`、`host-facts`、`models`、`lan-followup` |
+| 所有者入口 | `api`、`commands`、`tool` | `api`、`commands`、`tool`、双实例脚本 |
 
 界面位于 `src/client.tsx` 和 `src/client/`，由 `client.test.ts` 和双实例浏览器流程验证。修改源码后构建 `dist/`，不直接修改生成文件。
 
@@ -65,5 +65,7 @@ npm run test:e2e
 已有 Chromium 可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。浏览器覆盖设备面板、配对、收藏、引用、任务卡片、草稿恢复和窄屏；配置模型时继续验证模型切换、真实委派、按需文件和事件读取、离线引用。
 
 结果写入 `.e2e/acceptance.json`，截图和可访问性快照也在 `.e2e/`。交付说明写本次运行范围、结果和未验证项，不把历史通过次数写成当前保证。
+
+配置模型并设置 `E2E_BROWSER=1` 后，`npm run test:e2e -- --lan-followup-only` 可单独复测工作区归属、入站授权展示和原生审批的批准、拒绝流程。此模式缺少模型或浏览器配置时直接报错，不能与 `--protocol-only` 合用。审批使用隔离实例中的验收工具，不执行文件操作。
 
 本地凭据放 `.env`，临时研究记录放 `.agent/`，构建产物放 `dist/`，验收输出放 `.e2e/`，这些路径均由 Git 忽略。共享操作和契约维护在仓库文档中。

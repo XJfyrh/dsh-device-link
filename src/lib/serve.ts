@@ -35,7 +35,7 @@ interface ServerDependencies {
 export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, taskManager, executionProvider, resourceProvider, log = console }: ServerDependencies) {
   let listen: { host: string; port: number } | null = null
   let activePairing: (PairingGrant & { code: string; expiresAt: string }) | null = null
-  const accessCodes = new Map<string, { token: string; deviceId: string; expiresAt: number }>()
+  const accessCodes = new Map<string, { token: string; deviceId: string; expiresAt: number; sessionId?: string }>()
   const failures = new Map<string, { count: number; resetAt: number }>()
   const sockets = new Set<Duplex>()
   const authorizedSockets = new Map<Duplex, Set<string>>()
@@ -73,12 +73,15 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     for (const [code, access] of accessCodes) if (access.deviceId === deviceId) accessCodes.delete(code)
     await taskManager?.cancelOwner(deviceId)
   }
+  function checkGrant(entry: TrustedDevice): void {
+    const current = store.state().trusted[entry.deviceId]
+    if (!incomingAllowed() || !current?.active || current.tokenHash !== entry.tokenHash || JSON.stringify(current.scope) !== JSON.stringify(entry.scope)) throw new HttpError(403, 'grant changed during read')
+  }
   async function collect(entry: TrustedDevice): Promise<HostFacts> {
     if (!factsProvider) throw new HttpError(503, 'host facts unavailable')
     const facts = await factsProvider(entry.scope)
     // Re-check after asynchronous host reads and enforce filtering at the wire boundary.
-    const current = store.state().trusted[entry.deviceId]
-    if (!incomingAllowed() || !current || current.tokenHash !== entry.tokenHash || JSON.stringify(current.scope) !== JSON.stringify(entry.scope)) throw new HttpError(403, 'grant changed during read')
+    checkGrant(entry)
     return { ...facts, workspaces: facts.workspaces.filter(workspace => isPathAllowed(workspace.path, entry.scope.workspaces)),
       sessions: facts.sessions.filter(session => sessionAllowed(session, entry.scope)).map(session => {
         const task = taskManager?.sessionEvidence(entry, session.id)[0]
@@ -135,7 +138,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       const entry = store.state().trusted[access.deviceId]
       if (!incomingAllowed() || !entry || !verifyToken(access.token, entry.tokenHash)) throw new HttpError(401, 'access revoked')
       requireUi(entry)
-      res.writeHead(302, { location: '/', 'set-cookie': `dl_session=${access.token}; Path=/; HttpOnly; SameSite=Strict`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
+      res.writeHead(302, { location: access.sessionId ? `/?deviceLinkSession=${encodeURIComponent(access.sessionId)}` : '/', 'set-cookie': `dl_session=${access.token}; Path=/; HttpOnly; SameSite=Strict`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' })
       res.end()
       return
     }
@@ -165,7 +168,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     if (req.method === 'GET' && route === '/dl/session') {
       if (!sessionProvider) throw new HttpError(503, 'session content unavailable')
       const content = await sessionProvider(url.searchParams.get('id') ?? '', entry.scope)
-      await collect(entry)
+      checkGrant(entry)
       if (entry.scope.sessionSync !== 'content' || !sessionAllowed(content, entry.scope)) throw new HttpError(403, 'session is outside the grant')
       const tasks = taskManager?.sessionEvidence(entry, content.id) ?? []
       sendJson(res, 200, { ok: true, session: { ...content, tasks,
@@ -176,18 +179,20 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       if (!resourceProvider) throw new HttpError(503, 'resource service unavailable')
       const input = await readJson(req) as unknown as ResourceRequest
       const result = await resourceProvider(input, entry.scope)
-      const current = store.state().trusted[entry.deviceId]
-      if (!incomingAllowed() || !current?.active || current.tokenHash !== entry.tokenHash || JSON.stringify(current.scope) !== JSON.stringify(entry.scope)) throw new HttpError(403, 'grant changed during read', 'scope')
-      const tasks = input.kind === 'session' ? taskManager?.sessionEvidence(current, input.sessionId!) : undefined
+      checkGrant(entry)
+      const tasks = input.kind === 'session' ? taskManager?.sessionEvidence(entry, input.sessionId!) : undefined
       sendJson(res, 200, { ok: true, result: { ...result, ...(tasks ? { tasks } : {}) } }); return
     }
     if (req.method === 'POST' && route === '/dl/access') {
       requireUi(entry)
+      const body = await readJson(req)
+      checkGrant(entry)
+      if (body.sessionId !== undefined && (typeof body.sessionId !== 'string' || !/^[a-zA-Z0-9_-]{1,200}$/.test(body.sessionId))) throw new HttpError(400, 'invalid sessionId')
       for (const [code, access] of accessCodes) if (access.expiresAt <= Date.now()) accessCodes.delete(code)
       if (accessCodes.size >= 1000) throw new HttpError(429, 'too many pending access codes')
       const ac = crypto.randomBytes(32).toString('base64url')
       const expiresAt = Date.now() + (config.accessTtlMs ?? 60_000)
-      accessCodes.set(ac, { deviceId: entry.deviceId, token, expiresAt })
+      accessCodes.set(ac, { deviceId: entry.deviceId, token, expiresAt, sessionId: body.sessionId as string | undefined })
       sendJson(res, 200, { ok: true, url: `${origin()}/dl/enter?ac=${ac}`, expiresAt: new Date(expiresAt).toISOString() })
       return
     }
@@ -197,7 +202,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       const body = await readJson(req)
       if (typeof body.workspacePath !== 'string' || (route === '/dl/tasks' && typeof body.task !== 'string')) throw new HttpError(400, 'workspacePath and task required')
       const workspacePath = await authorizedWorkspace(body.workspacePath, entry.scope)
-      await collect(entry)
+      checkGrant(entry)
       const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined
       if (sessionId) {
         const owned = Object.values(store.state().incomingTasks).some(task => task.ownerDeviceId === entry.deviceId
@@ -207,13 +212,13 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
           if (!sessionProvider) throw new HttpError(503, 'session service unavailable')
           const session = await sessionProvider(sessionId, entry.scope)
           if (session.cwd !== workspacePath) throw new HttpError(403, 'session workspace does not match')
-          await collect(entry)
+          checkGrant(entry)
         }
       }
       if (route === '/dl/execution') {
         if (!executionProvider) throw new HttpError(503, '执行设备未提供模型目录')
         const context = await executionProvider(workspacePath, sessionId)
-        await collect(entry)
+        checkGrant(entry)
         sendJson(res, 200, { ok: true, ...context })
         return
       }
@@ -224,11 +229,12 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     const taskRoute = /^\/dl\/tasks\/([a-zA-Z0-9_-]{1,128})(\/cancel)?$/.exec(route)
     if (taskRoute) {
       if (!taskManager) throw new HttpError(503, 'task service unavailable')
-      await collect(entry)
+      checkGrant(entry)
       if (req.method === 'POST' && taskRoute[2]) {
         await readJson(req)
+        checkGrant(entry)
         const task = await taskManager.cancel(entry, taskRoute[1])
-        await collect(entry)
+        checkGrant(entry)
         sendJson(res, 200, { ok: true, task, cancelled: !task || task.status === 'stopped' })
       } else if (req.method === 'GET' && !taskRoute[2]) {
         sendJson(res, 200, { ok: true, task: taskManager.get(entry, taskRoute[1]) })

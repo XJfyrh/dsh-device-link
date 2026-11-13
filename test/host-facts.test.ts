@@ -135,17 +135,19 @@ test('status uses host list projections without reading hundreds of archive bodi
   assert.equal(facts.sessions[0].title, 'Task 780')
 })
 
-function delegationHarness({ end = true, fail = false } = {}) {
+function delegationHarness({ end = true, fail = false, rejectPrompt = false } = {}) {
   const events: HostEvent[] = []
   let canceled = 0
   let created = ''
   const current = session('task')
   current.seq = 1
   current.snapshotEvents = () => events
-  const ctx = context({ sessions: { get: () => current, list: () => [current] }, sessionController: {
+  const ctx = context({ workspaceController: { async create({ path }) { created = path; return { workspace: {workspaceId:'registered',path},created:false } } }, sessions: { get: () => current, list: () => [current] }, sessionController: {
     list: async () => ({ items: [] }),
-    async create(input) { created = input.cwd; return { sessionId: input.sessionId } },
-    async prompt(input) { if (end) setTimeout(() => events.push(
+    async create(input) { assert.equal(input.workspaceId, 'registered'); assert.equal('cwd' in input, false); return { sessionId: input.sessionId } },
+    async prompt(input) {
+      if (rejectPrompt) throw new Error('prompt rejected before admission')
+      if (end) setTimeout(() => events.push(
       { seq: 1, type: 'turn/start', data: { turn: 1 } },
       { seq: 2, type: 'user/message', data: { content: 'other request', source: { kind: 'user', rpcId: 'other' } } },
       { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
@@ -180,6 +182,18 @@ test('delegation reports provider failure instead of an empty success', async ()
   const result = await delegationHarness({ fail: true }).runner.run({ requestId: 'delegated-request', workspacePath: root, task: 'hello' })
   assert.equal(result.status, 'error')
   assert.match(result.error!, /provider failed/)
+  assert.equal(result.errorPhase, 'execution')
+})
+
+test('prompt admission failure stays a startup error after the event baseline is saved', async () => {
+  let baseline: number | undefined
+  const result = await delegationHarness({ rejectPrompt: true }).runner.run({
+    requestId: 'delegated-request', workspacePath: root, task: 'hello',
+    onProgress: async progress => { baseline = progress.baselineSeq },
+  })
+  assert.equal(baseline, 1)
+  assert.equal(result.status, 'error')
+  assert.equal(result.errorPhase, 'startup')
 })
 test('authorization cancellation cancels the remote task', async () => {
   const harness = delegationHarness({ end: false })
@@ -188,6 +202,51 @@ test('authorization cancellation cancels the remote task', async () => {
   setTimeout(() => abort.abort(), 10)
   assert.equal((await result).status, 'error')
   assert.equal(harness.canceled, 1)
+})
+
+test('cancellation before prompt admission leaves other work in the resumed session alone', async () => {
+  const abort = new AbortController()
+  let canceled = 0
+  const controller: HostServices['sessionController'] = {
+    ...delegationController(),
+    async resolveAgent() {
+      abort.abort(new Error('delegation stopped during resume'))
+      return { agent: { id: 'existing', session: session('existing'), status: 'running', options: {},
+        model: { current: () => undefined, select: () => {} } } }
+    },
+    async cancel() { canceled++ },
+  }
+  const runner = createDelegationRunner({ ctx: context({ sessionController: controller }) })
+  const result = await runner.run({ requestId: 'new-request', sessionId: 'existing', resume: true,
+    workspacePath: root, task: 'new task', signal: abort.signal })
+  assert.equal(result.cancelled, true)
+  assert.equal(canceled, 0)
+})
+
+test('cancellation after durable completion leaves the next session turn running', async () => {
+  const abort = new AbortController()
+  let canceled = 0
+  const events: HostEvent[] = []
+  const current = { ...session('task'), snapshotEvents: () => events }
+  const runner = createDelegationRunner({ ctx: context({
+    workspaceController: { create: async () => ({ workspace: { workspaceId: 'workspace', path: root }, created: false }) },
+    sessions: { get: () => current, list: () => [current] },
+    sessionController: { ...delegationController(),
+      async prompt(input) {
+        events.push({ seq: 0, type: 'turn/start', data: { turn: 1 } },
+          { seq: 1, type: 'user/message', data: { source: { rpcId: input.requestId } } },
+          { seq: 2, type: 'assistant/message', data: { turn: 1, message: { content: 'finished' } } },
+          { seq: 3, type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+          { seq: 4, type: 'turn/start', data: { turn: 2 } })
+        abort.abort()
+      },
+      async cancel() { canceled++ },
+    },
+  }) })
+  const result = await runner.run({ requestId: 'completed-request', workspacePath: root, task: 'hello', signal: abort.signal })
+  assert.equal(result.status, 'completed')
+  assert.equal(result.text, 'finished')
+  assert.equal(canceled, 0)
 })
 test('plugin disposal cancels owned work and rejects further delegation', async () => {
   const harness = delegationHarness({ end: false })

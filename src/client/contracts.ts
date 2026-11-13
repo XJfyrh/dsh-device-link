@@ -32,7 +32,8 @@ export interface ClientContext {
     toggleExpanded(): void
   }
   layout: { selectPanel(id: string | null): void }
-  sessions: { scope(sessionId: string): unknown }
+  sessions: { scope(sessionId: string): unknown; list: Snapshot<{ phase: string }> }
+  workspaces: { list: Snapshot<{ phase: string }> }
   conversation: { input: { for(scope: unknown): SessionInput } }
   uiWorkspace: { startSession(workspaceId?: string): void; openSession(target: string): void }
   effect(factory: () => (() => void)): void

@@ -1,6 +1,6 @@
 import crypto from 'node:crypto'
 import { isPathAllowed, sessionAllowed } from './scope.js'
-import { delegationEnd, delegationText } from './delegation.js'
+import { delegationEnd, delegationText, requestTurn } from './delegation.js'
 import type { HostContext } from './host.js'
 import { sameSelection } from './models.js'
 import {
@@ -42,10 +42,11 @@ export async function createTaskManager({ store, ctx, run }: {
           error = status === 'error' ? String(record(reason.error).message ?? `turn ended with ${reason.kind}`) : ''
         }
       }
-    } catch { /* The retained result remains available when history cannot be read. */ }
+    } catch { /* Preserve partial text and mark the task interrupted when history cannot be read. */ }
     await store.update(draft => {
       const current = draft.incomingTasks[taskKey(task.ownerDeviceId, task.id)]
-      if (current) Object.assign(current, { status, text, error: error || undefined, updatedAt: new Date().toISOString() })
+      if (current) Object.assign(current, { status, text, error: error || undefined,
+        errorPhase: status === 'error' ? 'execution' : undefined, updatedAt: new Date().toISOString() })
     })
   }
 
@@ -56,7 +57,22 @@ export async function createTaskManager({ store, ctx, run }: {
   function get(owner: TrustedDevice, id: string): DeviceTask {
     const task = store.state().incomingTasks[taskKey(owner.deviceId, id)]
     if (!task || !authorized(task, owner)) throw new HttpError(404, 'delegated task not found')
-    return publicTask(task)
+    const view = publicTask(task)
+    // Pending interactions are live host state, never a persisted promise that an approval still exists.
+    delete view.pendingInput
+    if (task.status !== 'running' || task.baselineSeq === undefined) return view
+    const baseline = task.baselineSeq
+    const events = ctx.get('sessions')?.get(task.sessionId)?.snapshotEvents(baseline) ?? []
+    const turn = requestTurn(events, task.baselineSeq, task.promptRequestId)
+    if (turn === undefined || delegationEnd(events, task.baselineSeq, task.promptRequestId)) return view
+    const pending = ctx.get('typertGateway')?.getPendingRemoteEvents().filter(item => String(item.agentId) === task.sessionId) ?? []
+    if (pending.some(item => item.event === 'approval/request')) {
+      const asked = events.findLast(event => event.seq >= baseline && event.type === 'approval/asked'
+        && !events.some(decision => decision.type === 'approval/decided' && decision.data.id === event.data.id))
+      view.pendingInput = { kind: 'approval', reason: typeof asked?.data.reason === 'string' ? asked.data.reason.slice(0, 4000) : undefined,
+        toolName: typeof asked?.data.toolName === 'string' ? asked.data.toolName : undefined, since: asked?.time }
+    } else if (pending.some(item => item.event === 'user-questions/request')) view.pendingInput = { kind: 'question' }
+    return view
   }
 
   async function execute(key: string, owner: TrustedDevice, controller: AbortController): Promise<void> {
@@ -85,13 +101,13 @@ export async function createTaskManager({ store, ctx, run }: {
         current.status = result.cancelled ? 'stopped' : result.status === 'completed' ? 'completed' : 'error'
         current.text = result.text ? result.text.slice(-64_000) : current.text
         current.error = result.cancelled ? undefined : result.error
-        current.errorPhase = current.error ? current.baselineSeq === undefined ? 'startup' : 'execution' : undefined
+        current.errorPhase = current.error ? result.errorPhase : undefined
         current.updatedAt = new Date().toISOString()
       })
     } catch (error) {
       await store.update(draft => {
         const current = draft.incomingTasks[key]
-        Object.assign(current, { status: 'error', error: errorMessage(error), errorPhase: current.baselineSeq === undefined ? 'startup' : 'execution', updatedAt: new Date().toISOString() })
+        Object.assign(current, { status: 'error', error: errorMessage(error), errorPhase: current.baselineSeq === undefined ? 'startup' : undefined, updatedAt: new Date().toISOString() })
       })
     } finally { running.delete(key) }
   }

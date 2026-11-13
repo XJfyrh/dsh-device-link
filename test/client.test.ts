@@ -5,7 +5,38 @@ import { buildSync } from 'esbuild'
 import { sentReferenceRule, createClientState, draftKey, serializeReference, parseAddress, parseReference, resourceAddress, openDeviceUi, cacheLabel } from '../src/client/state.ts'
 import type { ClientContext } from '../src/client/contracts.ts'
 import type { OutgoingTask } from '../src/lib/types.ts'
+import { sessionInWorkspaces } from '../src/client/scope.tsx'
+import { taskStatusLabel, taskStatusPresentation } from '../src/client/conversation.ts'
 import { setImmediate as nextTick } from 'node:timers/promises'
+
+test('authorization candidates use the host path rules for case, separators and directory boundaries', () => {
+  assert.equal(sessionInWorkspaces('e:/work/sub', ['E:\\Work'], 'win32'), true)
+  assert.equal(sessionInWorkspaces('E:\\WORK\\sub', ['e:/work/'], 'win32'), true)
+  assert.equal(sessionInWorkspaces('E:/work/child/../sub', ['E:/Work'], 'win32'), true)
+  assert.equal(sessionInWorkspaces('E:/work-elsewhere', ['E:/work'], 'win32'), false)
+  assert.equal(sessionInWorkspaces('E:/work/../private', ['E:/work'], 'win32'), false)
+  assert.equal(sessionInWorkspaces('F:/work/sub', ['E:/work'], 'win32'), false)
+  assert.equal(sessionInWorkspaces('\\\\HOST\\share\\work\\sub', ['//host/share/Work'], 'win32'), true)
+  assert.equal(sessionInWorkspaces('//host/another/work', ['//host/share'], 'win32'), false)
+  assert.equal(sessionInWorkspaces('/Work/sub', ['/Work/'], 'linux'), true)
+  assert.equal(sessionInWorkspaces('/work/sub', ['/Work'], 'linux'), false)
+  assert.equal(sessionInWorkspaces('/Work-elsewhere', ['/Work'], 'darwin'), false)
+  assert.equal(sessionInWorkspaces('/Work/child/../../private', ['/Work'], 'linux'), false)
+  assert.equal(sessionInWorkspaces('/Work\\sub', ['/Work'], 'linux'), false)
+  assert.equal(sessionInWorkspaces('/Work/sub', [], 'linux'), false)
+  assert.equal(sessionInWorkspaces('/Work/sub', 'all', 'linux'), true)
+})
+
+test('task failures show only the failure phase recorded by the executor', () => {
+  const task: OutgoingTask = { id: 'failed', deviceId: 'b', deviceName: 'B', workspacePath: '/work', prompt: 'work', createdAt: '', submission: 'accepted',
+    remote: { id: 'failed', sessionId: 's', workspacePath: '/work', prompt: 'work', status: 'error', text: '', createdAt: '', updatedAt: '' } }
+  for (const [errorPhase, label] of [[undefined, '任务失败'], ['startup', '启动失败'], ['execution', '执行失败']] as const) {
+    task.remote!.errorPhase = errorPhase
+    assert.equal(taskStatusLabel('error', errorPhase), label)
+    assert.deepEqual(taskStatusPresentation(task, false), { label, running: false })
+  }
+  assert.equal(taskStatusLabel('completed', 'startup'), '已完成')
+})
 
 test('task results render before a pending device state request finishes', async () => {
   const originalFetch = globalThis.fetch
@@ -33,10 +64,13 @@ test('desktop opens the authenticated HTTP URL without treating Electron null as
   const originalFetch = globalThis.fetch
   const originalWindow = globalThis.window
   const calls: string[] = []
-  globalThis.fetch = async () => Response.json({url:'http://192.168.1.2:47654/dl/enter?ac=test'})
+  globalThis.fetch = async (_url, init) => {
+    assert.deepEqual(JSON.parse(String(init?.body)), { deviceId: 'b', sessionId: 'approval-session' })
+    return Response.json({url:'http://192.168.1.2:47654/dl/enter?ac=test'})
+  }
   globalThis.window = { location:{protocol:'dsh-app:'}, open(url: string) { calls.push(url); return null } } as never
   try {
-    await openDeviceUi('b')
+    await openDeviceUi('b', 'approval-session')
     assert.deepEqual(calls, ['http://192.168.1.2:47654/dl/enter?ac=test'])
   } finally { globalThis.fetch = originalFetch; globalThis.window = originalWindow }
 })
@@ -109,7 +143,7 @@ test('@ input source offers cached workspace/session references without probing 
     window: { __ModuleLoader__: { load(definition: Parameters<Window['__ModuleLoader__']['load']>[0]) { plugin = definition.factory((() => ({})) as never) } } },
     fetch: async (route: string) => {
       routes.push(route)
-      return { ok: true, json: async () => ({ ok: true, peers: [{ deviceId: 'remote', name: 'Lab PC', online: false, cachedAt: '2026-11-09T00:00:00Z', cachedSessionIds: ['session-1'], status: { host: {
+      return { ok: true, json: async () => ({ ok: true, peers: [{ deviceId: 'remote', name: 'Lab PC', online: false, cachedAt: '2026-11-09T00:00:00Z', cachedSessionIds: ['session-1'], sessionCache: { 'session-1': 'content' }, status: { host: {
         workspaces: [{ id: 'w', title: 'My Project', path: '/My Project' }],
         sessions: [{ id: 'session-1', title: 'Cached work' }, { id: 'session-2', title: 'Metadata only' }],
       } } }] }) }
@@ -131,6 +165,44 @@ test('@ input source offers cached workspace/session references without probing 
   assert.match(candidates[0].value, /path=%2FMy%20Project/)
   assert.equal(trigger.onPick({ candidate: candidates[1] }).insert.ref, 'device://remote/session?id=session-1')
   assert.equal(trigger.onPick({ candidate: candidates[1] }).insert.appearance, 'session')
+})
+
+test('session links wait for both host feeds, navigate after their listeners and stop on disposal', async () => {
+  const compiled = buildSync({ entryPoints: ['src/client.tsx'], bundle: true, format: 'iife', write: false }).outputFiles[0].text
+  for (const disposed of [false, true]) {
+    let plugin: ReturnType<Parameters<Window['__ModuleLoader__']['load']>[0]['factory']> | undefined
+    const effects: (() => (() => void))[] = []
+    const events: string[] = []
+    const feed = () => {
+      let phase = 'loading'
+      const listeners = new Set<() => void>()
+      return { getSnapshot: () => ({ phase }), subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener) } },
+        ready() { phase = 'ready'; for (const listener of listeners) listener() }, listeners }
+    }
+    const sessions = feed(), workspaces = feed()
+    vm.runInNewContext(compiled, {
+      AbortController, URL, queueMicrotask,
+      window: { location: { href: 'http://device/?deviceLinkSession=approval-session' }, __ModuleLoader__: {
+        load(definition: Parameters<Window['__ModuleLoader__']['load']>[0]) { plugin = definition.factory((() => ({})) as never) },
+      } },
+    })
+    assert.ok(plugin)
+    plugin.apply({ effect(factory: () => (() => void)) { effects.push(factory) }, slots: { inject() {}, register() {} },
+      sessions: { list: sessions }, workspaces: { list: workspaces }, uiWorkspace: { openSession(id: string) { events.push(id) } },
+    } as unknown as ClientContext)
+    const dispose = effects[2]()
+    const stopHost = workspaces.subscribe(() => events.push('host-restoration'))
+    sessions.ready()
+    await nextTick()
+    assert.deepEqual(events, [])
+    workspaces.ready()
+    assert.deepEqual(events, ['host-restoration'])
+    if (disposed) dispose()
+    await nextTick()
+    assert.deepEqual(events, disposed ? ['host-restoration'] : ['host-restoration', 'approval-session'])
+    dispose(); stopHost()
+    assert.equal(sessions.listeners.size + workspaces.listeners.size, 0)
+  }
 })
 
 test('sent reference presentation preserves its locator and explicit excerpt; malformed text remains visible', () => {
@@ -251,4 +323,59 @@ for (const response of ['lost', 'stale'] as const) test(`a ${response} submissio
     const persisted = JSON.parse(storage.get('device-link-0.4:local')!) as { localTasks: Record<string, OutgoingTask> }
     assert.deepEqual(persisted.localTasks, {})
   } finally { globalThis.fetch = originalFetch; globalThis.window = previousWindow }
+})
+
+for (const action of ['submission', 'refresh', 'cancel'] as const) test(`a late ${action} response returns the latest approval state`, async () => {
+  const originalFetch = globalThis.fetch, originalWindow = globalThis.window
+  globalThis.window = { localStorage: { getItem: () => null, setItem() {} } } as never
+  let release!: (response: Response) => void
+  const response = new Promise<Response>(resolve => { release = resolve })
+  let requested: OutgoingTask | undefined
+  globalThis.fetch = async (_url, init) => {
+    const input = JSON.parse(String(init?.body)) as { id: string }
+    requested = { id: input.id, deviceId: 'b', deviceName: 'B', workspacePath: '/work', prompt: 'work', createdAt: '2026-11-13T00:00:00Z', submission: 'accepted',
+      checkedAt: '2026-11-13T00:00:01Z', remote: { id: input.id, sessionId: 's', workspacePath: '/work', prompt: 'work', text: '', status: 'running', createdAt: '', updatedAt: '2026-11-13T00:00:00Z' } }
+    return response
+  }
+  try {
+    const state = createClientState({} as ClientContext)
+    const pending = action === 'submission' ? state.submitTask({ deviceId: 'b', workspace: '/work', title: 'Work' }, { text: 'work' })
+      : action === 'refresh' ? state.refreshTask('task') : state.cancelTask('task')
+    assert.ok(requested?.remote)
+    const latest: OutgoingTask = { ...requested, checkedAt: '2026-11-13T00:00:02Z', remote: { ...requested.remote, pendingInput: { kind: 'approval' } } }
+    state.putTask(latest)
+    release(Response.json({ task: requested }))
+    const result = await pending
+    assert.equal(result.remote?.pendingInput?.kind, 'approval')
+    assert.equal(result, state.getSnapshot().tasks[0])
+  } finally { globalThis.fetch = originalFetch; globalThis.window = originalWindow }
+})
+
+test('focus refreshes active tasks immediately and coalesces overlapping focus events', async () => {
+  const originalFetch = globalThis.fetch, originalWindow = globalThis.window, originalDocument = globalThis.document
+  const win = new EventTarget(), doc = new EventTarget()
+  globalThis.window = Object.assign(win,{localStorage:{getItem:()=>null,setItem(){}}}) as never
+  globalThis.document = Object.assign(doc,{visibilityState:'visible'}) as never
+  const task: OutgoingTask = {id:'focus',deviceId:'b',deviceName:'B',workspacePath:'/work',prompt:'work',createdAt:'',submission:'accepted',remote:{id:'focus',sessionId:'s',workspacePath:'/work',prompt:'work',text:'',status:'running',createdAt:'',updatedAt:'2026-11-13T00:00:00Z'}}
+  let reads=0, release: (()=>void) | undefined
+  const block = new Promise<void>(resolve=>{release=resolve})
+  let shouldBlock=false
+  globalThis.fetch = async url => {
+    if(String(url).endsWith('/state')) return Response.json({identity:{deviceId:'a'},peers:[]})
+    if(String(url).endsWith('/tasks')) return Response.json({tasks:[task]})
+    reads++; if(shouldBlock) await block
+    return Response.json({task:{...task,checkedAt: shouldBlock ? '2026-11-13T00:00:02Z' : '2026-11-13T00:00:01Z',remote:{...task.remote,pendingInput:shouldBlock ? {kind:'approval'} : undefined}}})
+  }
+  const state=createClientState({} as ClientContext)
+  let stop=()=>{}
+  try {
+    await state.refresh(); stop=state.start(); await nextTick(); await nextTick()
+    const before=reads; shouldBlock=true
+    win.dispatchEvent(new Event('focus')); win.dispatchEvent(new Event('focus')); doc.dispatchEvent(new Event('visibilitychange'))
+    assert.equal(reads,before+1)
+    release!(); await nextTick(); await nextTick()
+    assert.equal(state.getSnapshot().tasks[0].remote?.pendingInput?.kind,'approval')
+    await state.refresh()
+    assert.equal(state.getSnapshot().tasks[0].remote?.pendingInput?.kind,'approval','older task list must not erase the newer live approval snapshot')
+  } finally {release!();stop();globalThis.fetch=originalFetch;globalThis.window=originalWindow;globalThis.document=originalDocument}
 })
