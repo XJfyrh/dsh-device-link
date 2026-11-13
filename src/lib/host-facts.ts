@@ -23,19 +23,17 @@ export async function collectHostFacts(ctx: Pick<HostContext, 'get'>, { scope, s
     .map(item => ({ id: item.id, path: item.path, title: item.title }))
   const live = ctx.get('sessions')?.list() ?? []
   const sessions = new Map<string, SessionFact>()
-  const query = ctx.get('sessionQuery')
-  if (query && scope?.sessionSync !== 'none') {
-    for (const entry of await query.listSessions()) {
-      const header = entry.header
-      if (!header.id || (scope && !sessionAllowed({ id: header.id, cwd: header.cwd ?? '' }, scope))) continue
-      if (live.some(session => session.id === header.id)) continue
-      try {
-        const snapshot = await query.readSession(header.id)
-        sessions.set(header.id, sessionFact(header.id, header.cwd ?? '', snapshot.events, entry.live, timestamp(header.createdAt)))
-      } catch { /* A deleted or unreadable archive does not hide other sessions. */ }
+  const controller = ctx.get('sessionController')
+  if (controller && scope?.sessionSync !== 'none') {
+    // The host list reads persisted projections, never folds every archived log.
+    const { items } = await controller.list({}, AbortSignal.timeout(4000))
+    for (const item of items) {
+      const fact = { id: item.sessionId, cwd: item.cwd ?? '', live: item.agentAvailable,
+        updatedAt: item.updatedAt, title: readableTitle({ id: item.sessionId, title: item.projections?.values.title ?? '' }) }
+      if (!scope || sessionAllowed(fact, scope)) sessions.set(fact.id, fact)
     }
   }
-  for (const session of live) {
+  for (const session of controller ? [] : live) {
     if (scope && !sessionAllowed({ id: session.id, cwd: session.header.cwd ?? '' }, scope)) continue
     sessions.set(session.id, sessionFact(session.id, session.header.cwd ?? '', session.snapshotEvents(), true, timestamp(session.updatedAt ?? session.header.createdAt), session.title))
   }

@@ -40,7 +40,8 @@ test('facts merge live and historical sessions, apply workspace and session filt
     workspaceRegistry: { list: () => [{ id: 'root', path: root, title: 'root' }, { id: 'outside', path: path.resolve('outside'), title: 'outside' }] },
     sessions: { list: () => [current], get: () => current },
     sessionQuery: { listSessions: async () => [{ header: current.header, live: true }, { header: session('cold').header, live: false }], readSession: async () => ({ session: current.header, events: [] }), readEvent: async () => { throw new Error('unexpected event read') } },
-    agents: { list: () => [{ id: 'live', session: current, status: 'running', options: { model: 'remote-model' } }], get: () => undefined },
+    agents: { list: () => [{ id: 'live', session: current, status: 'running', options: { model: 'remote-model' }, model: { current: () => undefined, select: () => {} } }], get: () => undefined },
+    sessionController: { ...delegationController(), list: async () => ({ items: ['live', 'cold'].map(sessionId => ({ sessionId, cwd: root, updatedAt: 1234, agentAvailable: sessionId === 'live' })) }) },
   })
   const scope = { ...defaultScope('different-account'), workspaces: [root], sessionSync: 'metadata' as const, sessionIds: ['live', 'cold'] }
   const facts = await collectHostFacts(ctx, { scope })
@@ -118,6 +119,22 @@ test('archive reads distinguish missing sessions from persistence failures', asy
   await assert.rejects(() => readSessionContent(ctx, 'missing', defaultScope('same-account')), error => error === failure)
 })
 
+function delegationController(): HostServices['sessionController'] {
+  return { list: async () => ({ items: [] }), create: async input => ({sessionId: input.sessionId}), prompt: async () => {}, cancel: async () => {},
+    resolveAgent: async () => { throw new Error('unexpected resume') }, modelCatalog: async () => { throw new Error('unexpected model lookup') },
+    agents: { serializeImageAdmission: async (_agent, operation) => operation() } }
+}
+
+test('status uses host list projections without reading hundreds of archive bodies', async () => {
+  let reads = 0
+  const ctx = context({ sessionController: { ...delegationController(), list: async () => ({ items: Array.from({length: 781}, (_, i) => ({sessionId: `s${i}`, cwd: root, updatedAt: i, agentAvailable: false, projections: {values: {title: `Task ${i}`}}})) }) },
+    sessionQuery: { listSessions: async () => [], readSession: async () => { reads++; throw new Error('must not read') }, readEvent: async () => { throw new Error('must not read') } } })
+  const facts = await collectHostFacts(ctx)
+  assert.equal(reads, 0)
+  assert.equal(facts.sessions.length, 200)
+  assert.equal(facts.sessions[0].title, 'Task 780')
+})
+
 function delegationHarness({ end = true, fail = false } = {}) {
   const events: HostEvent[] = []
   let canceled = 0
@@ -126,6 +143,7 @@ function delegationHarness({ end = true, fail = false } = {}) {
   current.seq = 1
   current.snapshotEvents = () => events
   const ctx = context({ sessions: { get: () => current, list: () => [current] }, sessionController: {
+    list: async () => ({ items: [] }),
     async create(input) { created = input.cwd; return { sessionId: input.sessionId } },
     async prompt(input) { if (end) setTimeout(() => events.push(
       { seq: 1, type: 'turn/start', data: { turn: 1 } },
@@ -144,8 +162,6 @@ function delegationHarness({ end = true, fail = false } = {}) {
     async resolveAgent() { throw new Error('unexpected resume') },
     async modelCatalog() { throw new Error('unexpected model lookup') },
     agents: {
-      selectionFor() { throw new Error('unexpected model lookup') },
-      selectForNextRequest() { throw new Error('unexpected model change') },
       async serializeImageAdmission(_agent, operation) { return operation() },
     },
   } })

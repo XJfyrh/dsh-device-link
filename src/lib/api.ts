@@ -11,7 +11,10 @@ import { renameDevice } from './identity.js'
 
 export async function statePayload(runtime: Runtime) {
   const { server, connector, store, hostFacts } = runtime
-  const peers = await Promise.all(Object.values(store.state().peers).map(peer => connector.sync(peer)))
+  const peers = Object.values(store.state().peers).map(peer => {
+    void connector.sync(peer, false, false)
+    return connector.cachedView(peer)
+  })
   return { ok: true as const, ...server.info(), identity: store.state().identity, pairing: server.pairingCode(),
     addresses: server.addresses(), host: await hostFacts(), peers, trusted: server.trusted(), favorites: store.state().favorites }
 }

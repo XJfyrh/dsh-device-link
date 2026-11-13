@@ -6,7 +6,7 @@
 
 ## 安装
 
-两台设备都需要 Node.js 24 或更新版本、DeepSeek Harness 和本插件。插件按当前宿主服务契约实现，两端使用同一份插件构建。
+两台设备使用 DeepSeek Harness 0.2.2-rc.3 和同一份插件构建。桌面版已包含运行环境；从源码使用 CLI 时需要 Node.js 24 或更新版本。插件按此版宿主接口实现。
 
 在源码目录执行：
 
@@ -19,6 +19,8 @@ dsh plugin --profile desktop add E:/dsh-device-link
 将示例路径替换为实际源码目录，重启 `desktop` profile。侧栏底部出现 **设备** 入口。
 
 向另一台设备分发时执行 `npm pack`，将生成的 `.tgz` 文件复制过去，再执行 `dsh plugin --profile desktop add <包的绝对路径>` 并重启。打包会先构建源码。
+
+桌面版也可以在插件页安装 `.tgz`。更新前退出正在使用该插件的 DSH 实例。若安装出现 `EPERM ... rename ... node_modules/dsh-device-link`，先确认实例已经退出；从源码链接安装切换到安装包时，再检查该路径是否仍为指向源码的目录链接。只移除确认过的旧链接后重装，保留源码目录与 `.dsh/device-link` 数据。
 
 ## 配对与授权
 

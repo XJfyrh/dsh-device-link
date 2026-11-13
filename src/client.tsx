@@ -1,10 +1,10 @@
 import { createComponents } from './client/components.js'
-import { createClientState, api, SOURCE, parseReference, reference, serializeReference, sentReferenceRule } from './client/state.js'
+import { createClientState, api, SOURCE, parseReference, reference, serializeReference, sentReferenceRule, cacheLabel } from './client/state.js'
 import { styles } from './client/styles.js'
 import type { Candidate } from './client/contracts.js'
 import type { PeerView } from './lib/connect.js'
 import { relativeTime } from './lib/presentation.js'
-import { installSettingsDeviceIcon } from './client/icons.js'
+import { createDeviceIcon } from './client/icons.js'
 
 window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
   const React = require('react')
@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
       return () => style.remove()
     })
     ctx.effect(() => state.start())
-    ctx.effect(installSettingsDeviceIcon)
+    ctx.slots.inject('settings.section.icon', () => ctx.slots.register({ name: 'settings.section.icon', id: 'device-link' }, createDeviceIcon(React)))
     ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'device-link', order: 16, label: '设备连接' }, components.Settings))
     ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'device-link', order: 20 }, components.Sidebar))
     ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'device-link', order: 40 }, components.Overlay))
@@ -45,7 +45,7 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
           }
           for (const session of peer.status?.host.sessions ?? []) {
             if (!peer.cachedSessionIds.includes(session.id)) continue
-            candidates.push({ name: `${session.title}（${peer.name}）`, label: `${session.title}（${peer.name}）`, description: `缓存会话，更新于 ${relativeTime(session.updatedAt || peer.cachedAt)}`, value: reference({ deviceId: peer.deviceId, sessionId: session.id, title: session.title }).ref, icon: 'session' })
+            candidates.push({ name: `${session.title}（${peer.name}）`, label: `${session.title}（${peer.name}）`, description: `${cacheLabel(peer, session.id)}，更新于 ${relativeTime(session.updatedAt || peer.cachedAt)}`, value: reference({ deviceId: peer.deviceId, sessionId: session.id, title: session.title }).ref, icon: 'session' })
           }
         }
         const query = request.query.toLowerCase()

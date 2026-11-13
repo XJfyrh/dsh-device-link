@@ -17,6 +17,16 @@ import { chromium, expect, type Page } from '@playwright/test'
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const cli = process.env.DSH_CLI ?? path.join(process.env.LOCALAPPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+const versionProbe = spawnSync(process.execPath, [cli, '--version'], { encoding: 'utf8', windowsHide: true })
+const hostVersion = versionProbe.stdout?.trim() ?? ''
+const versionParts = /^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/.exec(hostVersion)
+const minimum = [0, 2, 2, 3]
+const actual = versionParts ? [Number(versionParts[1]), Number(versionParts[2]), Number(versionParts[3]), versionParts[4] ? Number(versionParts[4]) : Infinity] : []
+const difference = actual.findIndex((value, index) => value !== minimum[index])
+if (versionProbe.status !== 0 || !actual.length || difference >= 0 && actual[difference] < minimum[difference]) {
+  throw new Error(`DSH ${hostVersion || 'unknown'} 不支持当前插件接口；设置 DSH_CLI 为桌面版同版本（至少 0.2.2-rc.3）的完整入口路径`)
+}
+console.log(`Harness host ${hostVersion}`)
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'device-link-e2e-'))
 const children: ChildProcess[] = []
 const protocolOnly = process.argv.includes('--protocol-only')
@@ -252,7 +262,7 @@ try {
     const grant = await api<{ code: string }>(a, 'allow', { relationship: 'same-account', scope: defaultScope('same-account') })
     const paired = await api<{ peer: { deviceId: string } }>(b, 'pair', { address: lanA, code: grant.code })
     peerId = paired.peer.deviceId
-    assert.ok((await api<DeviceState>(b, 'state')).peers[0].online)
+    await expect.poll(async () => (await api<DeviceState>(b, 'state')).peers[0].online, { timeout: 10_000 }).toBe(true)
     await assert.rejects(() => api(b, 'pair', { address: lanA, code: grant.code }))
   })
   await step('remote GUI loads through a one-time URL and WebSocket proxy', async () => {
@@ -478,7 +488,7 @@ try {
           await composer.fill('@harness-a')
           await page.getByRole('option').filter({ hasText: path.join(a.home, 'workspace') }).first().click()
           await composer.press('End')
-          await composer.pressSequentially(' 请调用 device_delegate 在引用的设备和工作区委派任务，让对方设备回复 WORKSPACE_MENTION_OK。')
+          await composer.pressSequentially(' 请在引用的设备工作区执行一条任务，让那台设备回复 WORKSPACE_MENTION_OK。')
           await page.getByRole('button', { name: '发送消息', exact: true }).click()
           const card = page.locator('.dl-task').filter({ hasText: 'WORKSPACE_MENTION_OK' }).first()
           await expect(card.locator('.task-state')).toHaveText('已完成', { timeout: 120_000 })
@@ -592,6 +602,15 @@ try {
         await expect(trusted).toHaveCount(0)
         await capture(page, 'device-settings')
         await settings.getByRole('button', { name: '关闭连接设置', exact: true }).click()
+        await page.keyboard.press('Control+Alt+Comma')
+        const nativeSettings = page.locator('[data-shortcut-modal="settings"]')
+        const deviceNav = nativeSettings.locator('nav').getByRole('button', { name: '设备连接', exact: true })
+        await deviceNav.click()
+        await expect(deviceNav.locator('svg')).toHaveCount(1)
+        await expect(deviceNav.locator('.dl-device-icon')).toHaveCount(1)
+        await expect(nativeSettings.getByLabel('本机名称', { exact: true })).toHaveValue('harness-b')
+        await capture(page, 'native-device-settings')
+        await page.keyboard.press('Escape')
         const closePreview = page.getByRole('button', { name: '收起右侧边栏', exact: true })
         if (await closePreview.isVisible()) await closePreview.click()
         await page.getByRole('button', { name: '收起侧边栏', exact: true }).click()
@@ -600,8 +619,11 @@ try {
         await assertFooterLayout(page)
         await capture(page, 'device-footer-collapsed')
         await page.setViewportSize({ width: 760, height: 840 })
+        await page.keyboard.press('Control+Alt+B')
+        await expect(page.locator('.device-trigger')).toBeVisible()
         await assertFooterLayout(page)
         await page.getByRole('button', { name: '设备', exact: true }).click()
+        await page.getByRole('button', { name: '关闭设备面板', exact: true }).click({ trial: true })
         await capture(page, 'device-panel-narrow')
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false)
         await page.keyboard.press('Escape')
@@ -642,6 +664,6 @@ try {
   await fs.rm(resolved, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 })
 }
 await fs.mkdir(path.join(project, '.e2e'), { recursive: true })
-await fs.writeFile(path.join(project, '.e2e', 'acceptance.json'), JSON.stringify({ completedAt: new Date().toISOString(), modelConfigured, passed, failed, tests: report }, null, 2))
+await fs.writeFile(path.join(project, '.e2e', 'acceptance.json'), JSON.stringify({ completedAt: new Date().toISOString(), hostVersion, modelConfigured, passed, failed, tests: report }, null, 2))
 console.log(`${passed} passed, ${failed} failed`)
 process.exitCode = failed ? 1 : 0

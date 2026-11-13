@@ -50,6 +50,8 @@ npm run test:e2e:protocol
 
 此模式从临时 home 启动，指定空的测试凭据名和回环模型地址，验证缺少凭据时的持久化错误结果及协议流程。它不加载项目 `.env`，也不复制模型配置。默认 Harness 入口为 `%LOCALAPPDATA%/npm/node_modules/@deepseek-ai/dsh/lib/bin.js`，其他安装位置设置 `DSH_CLI`。
 
+验收前执行目标入口的 `--version`。本插件目标宿主是 0.2.2-rc.3；全局 npm CLI 与桌面版内置宿主可能不同，不能用旧 CLI 的通过结果代替桌面版验收。设置 `DSH_CLI` 为与桌面版相同版本的完整入口路径。
+
 真实模型验证：将 `.env.example` 复制为 `.env`，填写 `DEEPSEEK_API_KEY` 后执行 `npm run test:e2e`。脚本检查回复标识、受限工作区读写、越界拒绝、正文与工具结果读取、任务重试、续写和停止。也可设置 `E2E_MODEL_HOME`，从指定隔离模板复制 `.credentials.yaml` 和 `settings.json`。
 
 浏览器检查：

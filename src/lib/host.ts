@@ -16,6 +16,7 @@ export interface HostAgent {
   status: string
   session: HostSession
   options: { model?: string; provider?: string }
+  model: { current(): ModelSelection | undefined; select(selection: ModelSelection): void }
   inbox?: { nextTurn: HostMessage[]; nextStep: HostMessage[] }
 }
 export interface ToolDefinition {
@@ -35,11 +36,10 @@ export interface HostServices {
   permissionPresets: { set(session: HostSession, preset: string): void }
   sandboxPolicy: { resolve(request: { session: HostSession }): { mode: string; workspaceRoot: string } }
   sessionController: {
+    list(request: Record<string, never>, signal: AbortSignal): Promise<{ items: { sessionId: string; cwd?: string; updatedAt: number; agentAvailable: boolean; projections?: { values: { title?: string | null } } }[] }>
     modelCatalog(): Promise<ModelCatalog>
     /** Public selectModel also changes the device default; delegated choices are session-local. */
     agents: {
-      selectionFor(agent: HostAgent): { current: ModelSelection }
-      selectForNextRequest(agent: HostAgent, selection: ModelSelection): void
       serializeImageAdmission<T>(agent: HostAgent, operation: () => Promise<T>): Promise<T>
     }
     create(request: { sessionId: string; cwd: string }): Promise<{ sessionId: string }>

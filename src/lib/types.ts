@@ -1,4 +1,4 @@
-export const APP_VERSION = '0.5.0'
+export const APP_VERSION = '0.5.1'
 export const API_VERSION = 'v2'
 
 export type WorkspaceScope = 'all' | string[]
@@ -34,7 +34,12 @@ export interface ModelCatalog {
 export interface ExecutionContext { catalog: ModelCatalog; selected: ModelSelection; busy: boolean }
 export interface SessionMessage { role: 'user' | 'assistant'; text: string; seq?: number; requestId?: string; turn?: number; timestamp?: number; selection?: ModelSelection }
 export interface EvidenceEvent { seq: number; type: string; text: string; revision: string; time?: number; truncated: boolean }
-export interface SessionContent extends SessionFact { messages: SessionMessage[]; truncated: boolean; evidence: EvidenceEvent[]; evidenceTruncated: boolean }
+export interface SessionTaskEvidence {
+  id: string; promptRequestId?: string; prompt: string; status: TaskStatus; error?: string; text: string
+  errorPhase?: 'startup' | 'execution'
+  createdAt: string; updatedAt: string; truncated: boolean
+}
+export interface SessionContent extends SessionFact { messages: SessionMessage[]; truncated: boolean; evidence: EvidenceEvent[]; evidenceTruncated: boolean; tasks?: SessionTaskEvidence[] }
 export interface CachedSession extends SessionContent { cachedAt: string }
 export interface HostFacts {
   platform: string
@@ -87,6 +92,7 @@ export interface DeviceTask {
   updatedAt: string
   text: string
   error?: string
+  errorPhase?: 'startup' | 'execution'
   provider?: string
   model?: string
   reasoningEffort?: string

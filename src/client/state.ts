@@ -31,11 +31,28 @@ export async function api<T>(route: string, body?: unknown, signal?: AbortSignal
   return payload
 }
 export function message(error: unknown): string { return error instanceof Error ? error.message : String(error) }
+export async function openDeviceUi(deviceId: string): Promise<void> {
+  if (window.location.protocol === 'dsh-app:') {
+    const { url } = await api<{ url: string }>('open', { deviceId })
+    // Electron forwards HTTP(S) to the system browser and intentionally returns null.
+    window.open(url, '_blank', 'noopener,noreferrer')
+    return
+  }
+  const tab = window.open('about:blank', '_blank')
+  if (!tab) throw new Error('请允许弹窗后重试')
+  tab.opener = null
+  try { tab.location.href = (await api<{ url: string }>('open', { deviceId })).url }
+  catch (error) { tab.close(); throw error }
+}
 export function requestId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 export function active(task: OutgoingTask): boolean {
   return task.remote ? ['queued', 'running', 'stopping'].includes(task.remote.status) : task.submission === 'pending'
+}
+export function cacheLabel(peer: PeerView | undefined, sessionId: string): string {
+  const state = peer?.sessionCache?.[sessionId]
+  return state === 'content' ? '已缓存正文' : state === 'tasks' ? '任务记录可读' : state === 'empty' ? '暂无正文' : '仅会话目录'
 }
 export function reference(resource: Resource): Reference {
   let ref = resource.sessionId
@@ -96,7 +113,7 @@ export const sentReferenceRule = {
         if (typeof data.label !== 'string' || typeof data.source !== 'string' || typeof data.referenceId !== 'string' || !data.referenceId
           || !descriptor || descriptor.id !== data.referenceId || descriptor.deviceId !== resource.deviceId
           || typeof descriptor.device !== 'string' || typeof descriptor.title !== 'string' || typeof descriptor.workspacePath !== 'string'
-          || typeof descriptor.createdAt !== 'string' || !['online', 'cached', 'unavailable'].includes(descriptor.availability)
+          || typeof descriptor.referenceCreatedAt !== 'string' || !['online', 'cached', 'unavailable'].includes(descriptor.availability)
           || !Array.isArray(descriptor.capabilities) || !descriptor.capabilities.every(value => typeof value === 'string')
           || (resource.sessionId ? descriptor.kind !== 'session' || descriptor.sessionId !== resource.sessionId
             : descriptor.kind !== 'workspace' || descriptor.workspacePath !== resource.workspace)) continue
@@ -119,6 +136,8 @@ export function createClientState(ctx: ClientContext) {
   const controller = new AbortController()
   let pending: Promise<void> | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
+  let taskTimer: ReturnType<typeof setTimeout> | undefined
+  const refreshErrors = { state: '', tasks: '' }
   let toastTimer: ReturnType<typeof setTimeout> | undefined
   function persist() {
     if (!storageKey) return
@@ -135,8 +154,15 @@ export function createClientState(ctx: ClientContext) {
     toastTimer = setTimeout(() => change({ toast: '' }), 5000)
   }
   function refresh(): Promise<void> {
-    return pending ??= Promise.all([api<DeviceState>('state', undefined, controller.signal), api<{ tasks: OutgoingTask[] }>('tasks', undefined, controller.signal)])
-      .then(([data, result]) => {
+    if (pending) return pending
+    const tasksAtStart = new Map(view.tasks.map(task => [task.id, task]))
+    const report = (kind: 'state' | 'tasks', error = '') => {
+      if (controller.signal.aborted) return
+      refreshErrors[kind] = error
+      change({ error: Object.values(refreshErrors).filter(Boolean).join('；') })
+    }
+    return pending ??= Promise.allSettled([
+      api<DeviceState>('state', undefined, controller.signal).then(data => {
         if (controller.signal.aborted) return
         if (!storageKey) {
           storageKey = `device-link-0.4:${data.identity.deviceId}`
@@ -149,24 +175,41 @@ export function createClientState(ctx: ClientContext) {
             if (saved.returnTarget && ['workspace', 'tasks', 'local'].includes(saved.returnTarget.source)) view.returnTarget = saved.returnTarget
           } catch { /* A damaged local draft never prevents loading device data. */ }
         }
+        change({ data, tasks: [...view.tasks, ...Object.values(localTasks).filter(task => !view.tasks.some(item => item.id === task.id))] })
+        report('state')
+        persist()
+      }).catch(error => report('state', `设备状态加载失败：${message(error)}`)),
+      api<{ tasks: OutgoingTask[] }>('tasks', undefined, controller.signal).then(result => {
+        if (controller.signal.aborted) return
         for (const task of result.tasks) {
           if (localTasks[task.id]?.cancelRequested && active(task)) task.cancelRequested = true
           else delete localTasks[task.id]
         }
-        const remoteIds = new Set(result.tasks.map(task => task.id))
-        change({ data, tasks: [...result.tasks, ...Object.values(localTasks).filter(task => !remoteIds.has(task.id))].sort((a, b) => b.createdAt.localeCompare(a.createdAt)), error: '' })
+        const merged = new Map(result.tasks.map(task => [task.id, newerTask(task)]))
+        for (const task of view.tasks) if (tasksAtStart.get(task.id) !== task && !merged.has(task.id)) merged.set(task.id, task)
+        for (const task of Object.values(localTasks)) if (!merged.has(task.id)) merged.set(task.id, task)
+        change({ tasks: [...merged.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) })
+        report('tasks')
         persist()
-      })
-      .catch(error => { if (!controller.signal.aborted) change({ error: message(error) }) })
+      }).catch(error => report('tasks', `任务列表加载失败：${message(error)}`)),
+    ]).then(() => {})
       .finally(() => { pending = undefined })
   }
   async function poll() {
     await refresh()
+    if (!controller.signal.aborted) timer = setTimeout(() => void poll(), view.data?.peers.some(peer => peer.checking) ? 1500 : 10_000)
+  }
+  async function pollTasks() {
     if (controller.signal.aborted) return
     await Promise.allSettled(view.tasks.filter(task => active(task) || task.cancelRequested).map(task => localTasks[task.id] ? sendLocal(task.id) : refreshTask(task.id)))
-    if (!controller.signal.aborted) timer = setTimeout(() => void poll(), view.tasks.some(active) ? 2500 : 10_000)
+    if (!controller.signal.aborted) taskTimer = setTimeout(() => void pollTasks(), 2500)
+  }
+  function newerTask(task: OutgoingTask): OutgoingTask {
+    const current = view.tasks.find(item => item.id === task.id)
+    return current?.remote && (!task.remote || current.remote.updatedAt > task.remote.updatedAt) ? current : task
   }
   function putTask(task: OutgoingTask) {
+    task = newerTask(task)
     change({ tasks: [task, ...view.tasks.filter(item => item.id !== task.id)].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) })
   }
   function sendLocal(id: string): Promise<OutgoingTask> {
@@ -263,7 +306,7 @@ export function createClientState(ctx: ClientContext) {
     saveScroll(resource: Resource, top: number) { scrolls[draftKey(resource)] = top; clearTimeout(scrollTimer); scrollTimer = setTimeout(persist, 250) },
     peer(id: string): PeerView | undefined { return view.data?.peers.find(peer => peer.deviceId === id) },
     currentSession: () => ctx.sidebarRight.mounted.getSnapshot(),
-    start() { void poll(); return () => { persist(); controller.abort(); clearTimeout(timer); clearTimeout(toastTimer); clearTimeout(scrollTimer) } },
+    start() { void poll(); void pollTasks(); return () => { persist(); controller.abort(); clearTimeout(timer); clearTimeout(taskTimer); clearTimeout(toastTimer); clearTimeout(scrollTimer) } },
   }
 }
 export type ClientState = ReturnType<typeof createClientState>

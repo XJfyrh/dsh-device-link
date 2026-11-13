@@ -22,6 +22,20 @@ async function fixture(t: TestContext, run: (input: DelegateInput) => Promise<De
   return { store, manager, owner, directory }
 }
 
+test('startup failures retain prompt and error as separate session evidence scoped to the submitting grant', async t => {
+  const h = await fixture(t, async () => { throw new Error('model unavailable before prompt') })
+  const submitted = await h.manager.submit(h.owner, {id:'startup',workspacePath:h.directory,task:'create hello.txt'})
+  await h.manager.dispose()
+  const [evidence] = h.manager.sessionEvidence(h.owner, submitted.sessionId)
+  assert.equal(evidence.prompt, 'create hello.txt')
+  assert.equal(evidence.status, 'error')
+  assert.equal(evidence.error, 'model unavailable before prompt')
+  assert.equal(evidence.errorPhase, 'startup')
+  assert.equal(evidence.text, '')
+  assert.deepEqual(h.manager.sessionEvidence({...h.owner,tokenHash:'replacement'}, submitted.sessionId), [])
+  assert.deepEqual(h.manager.sessionEvidence({...h.owner,scope:{...h.owner.scope,sessionSync:'metadata'}}, submitted.sessionId), [])
+})
+
 test('task submission is idempotent and cancellation survives replay', async t => {
   let runs = 0
   const h = await fixture(t, async input => {

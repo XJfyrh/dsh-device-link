@@ -2,9 +2,44 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { buildSync } from 'esbuild'
-import { sentReferenceRule, createClientState, draftKey, serializeReference, parseAddress, parseReference, resourceAddress } from '../src/client/state.ts'
+import { sentReferenceRule, createClientState, draftKey, serializeReference, parseAddress, parseReference, resourceAddress, openDeviceUi, cacheLabel } from '../src/client/state.ts'
 import type { ClientContext } from '../src/client/contracts.ts'
 import type { OutgoingTask } from '../src/lib/types.ts'
+import { setImmediate as nextTick } from 'node:timers/promises'
+
+test('task results render before a pending device state request finishes', async () => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  let release!: (value: Response) => void
+  const pendingState = new Promise<Response>(resolve => { release = resolve })
+  globalThis.window = { localStorage: { getItem: () => null, setItem() {} } } as never
+  const task: OutgoingTask = { id: 'failed', deviceId: 'b', deviceName: 'B', workspacePath: '/work', prompt: 'write file', createdAt: '', submission: 'accepted',
+    remote: {id: 'failed', sessionId: 's', workspacePath: '/work', prompt: 'write file', status: 'error', error: 'startup failed', text: '', createdAt: '', updatedAt: ''} }
+  globalThis.fetch = async url => String(url).endsWith('/state') ? pendingState : Response.json({tasks:[task]})
+  const state = createClientState({} as ClientContext)
+  const refreshing = state.refresh()
+  try {
+    await nextTick()
+    assert.equal(state.getSnapshot().data, null)
+    assert.equal(state.getSnapshot().tasks[0].remote?.error, 'startup failed')
+    assert.equal(cacheLabel({ sessionCache: {s: 'empty'} } as never, 's'), '暂无正文')
+  } finally {
+    release(Response.json({identity:{deviceId:'a'},peers:[]})); await refreshing
+    globalThis.fetch = originalFetch; globalThis.window = originalWindow
+  }
+})
+
+test('desktop opens the authenticated HTTP URL without treating Electron null as a blocked popup', async () => {
+  const originalFetch = globalThis.fetch
+  const originalWindow = globalThis.window
+  const calls: string[] = []
+  globalThis.fetch = async () => Response.json({url:'http://192.168.1.2:47654/dl/enter?ac=test'})
+  globalThis.window = { location:{protocol:'dsh-app:'}, open(url: string) { calls.push(url); return null } } as never
+  try {
+    await openDeviceUi('b')
+    assert.deepEqual(calls, ['http://192.168.1.2:47654/dl/enter?ac=test'])
+  } finally { globalThis.fetch = originalFetch; globalThis.window = originalWindow }
+})
 
 test('device previews reuse one tab and retain the selected receipt without closing other plugin or session tabs', () => {
   let tabs = [
@@ -49,7 +84,7 @@ test('sending a reference includes a locator without loading session contents; e
   const calls: string[] = []
   globalThis.fetch = async url => {
     calls.push(String(url))
-    return new Response(JSON.stringify({ ok: true, descriptor: { id: 'ref1', kind: 'session', sessionId: 's1', deviceId: 'peer', device: 'Lab', title: 'Decision', workspacePath: '/work', capabilities: ['搜索对话文本'], availability: 'cached', createdAt: 'now' } }))
+    return new Response(JSON.stringify({ ok: true, descriptor: { id: 'ref1', kind: 'session', sessionId: 's1', deviceId: 'peer', device: 'Lab', title: 'Decision', workspacePath: '/work', capabilities: ['搜索对话文本'], availability: 'cached', referenceCreatedAt: 'now' } }))
   }
   try {
     const wire = await serializeReference('device://peer/session?id=s1', new AbortController().signal)
@@ -101,7 +136,7 @@ test('@ input source offers cached workspace/session references without probing 
 test('sent reference presentation preserves its locator and explicit excerpt; malformed text remains visible', () => {
   const data = { ref: 'device://remote/session?id=s1', label: 'Cached work（Lab PC）', source: '选中原文', referenceId: 'ref1',
     descriptor: { id: 'ref1', deviceId: 'remote', device: 'Lab PC', kind: 'session', sessionId: 's1', title: 'Cached work', workspacePath: '/workspace',
-      createdAt: '2026-11-10T00:00:00Z', availability: 'cached', capabilities: ['搜索对话文本'] },
+      referenceCreatedAt: '2026-11-10T00:00:00Z', availability: 'cached', capabilities: ['搜索对话文本'] },
     excerpt: { text: '</device-link-reference> original content', seq: 7, cachedAt: '2026-11-10T00:00:00Z' },
   }
   const wire = `<device-link-reference>\n${JSON.stringify(data).replaceAll('<', '\\u003c')}\n</device-link-reference>`

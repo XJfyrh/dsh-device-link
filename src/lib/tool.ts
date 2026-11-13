@@ -19,7 +19,7 @@ export function registerDeviceTools(ctx: Pick<HostContext, 'get'>, { load, enabl
   let refreshing: Promise<void> | undefined
   function refresh(): Promise<void> {
     return refreshing ??= load().then(async ({ store, connector }) => {
-      const next = await Promise.all(Object.values(store.state().peers).map(peer => connector.sync(peer)))
+      const next = await Promise.all(Object.values(store.state().peers).map(peer => connector.sync(peer, false, false)))
       if (!stopped) devices = next
     }).catch(error => console.warn('[device-link] sync', error)).finally(() => { refreshing = undefined })
   }
@@ -56,7 +56,8 @@ export function registerDeviceTools(ctx: Pick<HostContext, 'get'>, { load, enabl
           sessionId: typeof args.sessionId === 'string' ? args.sessionId : undefined, originSessionId, originCallId: execution?.callId })
         const task = await outgoingTasks.wait(id, Math.min(600, Math.max(1, Number(args.timeoutSeconds) || 300)) * 1000, execution?.signal)
         return { taskId: task.id, device: peer.name, workspace: task.workspacePath, sessionId: task.remote?.sessionId ?? '',
-          status: task.remote?.status ?? task.submission, text: task.remote?.text ?? '', error: task.remote?.error ?? task.connectionError ?? '' }
+          status: task.remote?.status ?? task.submission, text: task.remote?.text ?? '', error: task.remote?.error ?? task.connectionError ?? '',
+          ...(task.remote?.error ? { errorOrigin: 'execution-device', executionDevice: peer.name, errorPhase: task.remote.errorPhase } : {}) }
       },
     }))
     disposers.push(tools.register({
@@ -67,7 +68,8 @@ export function registerDeviceTools(ctx: Pick<HostContext, 'get'>, { load, enabl
         const { outgoingTasks } = await load()
         const task = args.cancel === true ? await outgoingTasks.cancel(String(args.taskId)) : await outgoingTasks.refresh(String(args.taskId))
         return { taskId: task.id, device: task.deviceName, workspace: task.workspacePath, sessionId: task.remote?.sessionId ?? '',
-          status: task.remote?.status ?? task.submission, text: task.remote?.text ?? '', error: task.remote?.error ?? task.connectionError ?? '' }
+          status: task.remote?.status ?? task.submission, text: task.remote?.text ?? '', error: task.remote?.error ?? task.connectionError ?? '',
+          ...(task.remote?.error ? { errorOrigin: 'execution-device', executionDevice: task.deviceName, errorPhase: task.remote.errorPhase } : {}) }
       },
     }))
   }
@@ -76,6 +78,8 @@ export function registerDeviceTools(ctx: Pick<HostContext, 'get'>, { load, enabl
     '## 跨设备协作',
     'device-link-reference 的 referenceId 是按需读取入口。先用 device_inspect 查看范围，用 device_search 找线索，再用 device_read 读取命中的原文。未读取的资料不能当作已知内容。',
     '读取使用搜索返回的 revision 与 path/seq；nextLine 或 nextOffset 可继续读取。版本变化时重新搜索，不把当前代码当成历史执行版本。搜索未命中仅适用于返回的 coverage；缓存资料必须注明缓存时间。',
+    'emptyReason=empty-directory 表示该目录没有条目；no-events 表示没有可读会话事件。truncated=false 时不要反复搜索已确认的空范围，也不要猜测 path、seq 或 revision。tasks 是独立的任务提交与结果记录，不是会话消息；即使没有正文，也要据此说明启动失败或执行状态。',
+    'referenceCreatedAt 是引用入口的创建时间；cachedAt 是本机缓存采集时间，sessionUpdatedAt 是执行设备报告的会话更新时间。它们不是同一事件，跨设备时钟也可能不同，不能仅凭先后判断数据异常。errorOrigin=execution-device 表示错误来自执行设备，不能归因于本机。',
     '引用不代表委派或续接。分析资料在本地完成；用户要求在设备工作区执行操作时用 device_delegate。引用选中文字已经随消息提供，无需为同一段重复读取。',
     'device_delegate 返回 taskId。任务尚未完成时，用 device_task 查询进度与结果。继续同一设备会话可传 sessionId。',
     '面向用户使用其当前语言，以设备名称、文件路径和行号、会话标题或任务摘要说明来源。设备、任务和会话 id、referenceId、revision 哈希只用于工具调用，用户明确要求诊断标识时再展示。',

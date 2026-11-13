@@ -43,6 +43,7 @@ export interface TabProps {
 }
 export interface MarkdownProps { text: string; labels: { code: { copyLabel: string; copiedLabel: string; toolbarLabels: { codeLabel: string; wrapLabel: string; unwrapLabel: string } }; footnotes: string } }
 export interface ClientPrimitives {
+  useModalLayer(ref: React.RefObject<HTMLElement | null>, open: boolean, onClose: () => void): void
   MarkdownText: React.ComponentType<MarkdownProps>
   TextShimmer: React.ComponentType<{ active?: boolean; className?: string; children?: React.ReactNode }>
   IconCopyOutlineRegular: React.ComponentType<{ size?: number }>

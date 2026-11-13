@@ -1,11 +1,11 @@
 import crypto from 'node:crypto'
-import { isPathAllowed } from './scope.js'
+import { isPathAllowed, sessionAllowed } from './scope.js'
 import { delegationEnd, delegationText } from './delegation.js'
 import type { HostContext } from './host.js'
 import { sameSelection } from './models.js'
 import {
   HttpError, errorMessage, record, type DelegateInput, type DelegateResult,
-  type DeviceTask, type Store, type StoredTask, type TrustedDevice, type ModelSelection,
+  type DeviceTask, type Store, type StoredTask, type TrustedDevice, type ModelSelection, type SessionTaskEvidence,
 } from './types.js'
 
 export const activeTask = (task: Pick<DeviceTask, 'status'>) => ['queued', 'running', 'stopping'].includes(task.status)
@@ -85,11 +85,13 @@ export async function createTaskManager({ store, ctx, run }: {
         current.status = result.cancelled ? 'stopped' : result.status === 'completed' ? 'completed' : 'error'
         current.text = result.text ? result.text.slice(-64_000) : current.text
         current.error = result.cancelled ? undefined : result.error
+        current.errorPhase = current.error ? current.baselineSeq === undefined ? 'startup' : 'execution' : undefined
         current.updatedAt = new Date().toISOString()
       })
     } catch (error) {
       await store.update(draft => {
-        Object.assign(draft.incomingTasks[key], { status: 'error', error: errorMessage(error), updatedAt: new Date().toISOString() })
+        const current = draft.incomingTasks[key]
+        Object.assign(current, { status: 'error', error: errorMessage(error), errorPhase: current.baselineSeq === undefined ? 'startup' : 'execution', updatedAt: new Date().toISOString() })
       })
     } finally { running.delete(key) }
   }
@@ -164,6 +166,16 @@ export async function createTaskManager({ store, ctx, run }: {
     await Promise.all(keys.map(key => stopKey(key, '设备授权已变更')))
   }
   return { submit, get, cancel, cancelOwner,
+    sessionEvidence(owner: TrustedDevice, sessionId: string): SessionTaskEvidence[] {
+      if (owner.scope.sessionSync !== 'content') return []
+      return Object.values(store.state().incomingTasks)
+        .filter(task => task.sessionId === sessionId && task.ownerDeviceId === owner.deviceId && task.tokenHash === owner.tokenHash
+          && sessionAllowed({ id: sessionId, cwd: task.workspacePath }, owner.scope))
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, 10)
+        .map(task => ({ id: task.id, promptRequestId: task.promptRequestId, prompt: task.prompt.slice(0, 4000), status: task.status,
+          error: task.error?.slice(0, 4000), errorPhase: task.errorPhase, text: task.text.slice(-8000), createdAt: task.createdAt, updatedAt: task.updatedAt,
+          truncated: task.prompt.length > 4000 || task.text.length > 8000 || (task.error?.length ?? 0) > 4000 }))
+    },
     async dispose() {
       disposed = true
       await Promise.all([...running.keys()].map(key => stopKey(key, 'device-link stopped')))

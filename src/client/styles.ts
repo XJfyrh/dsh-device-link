@@ -1,5 +1,4 @@
 import { nativeWhaleStyles } from './native-running.js'
-import { deviceIconMask } from './icons.js'
 
 export const styles = `
 ${nativeWhaleStyles}
@@ -217,8 +216,6 @@ ${nativeWhaleStyles}
   width:7px;
   height:7px;
 }
-[data-shortcut-modal="settings"] nav button[data-device-link-settings]>svg { display:none; }
-[data-shortcut-modal="settings"] nav button[data-device-link-settings]:before { content:'';display:block;width:16px;height:16px;flex:none;background:currentColor;mask:url("${deviceIconMask}") center/contain no-repeat; }
 .dl-device-icon {
   display:block;
   flex:none;

@@ -13,12 +13,13 @@ const catalog = {default:defaultModel,groups:[{id:'p',name:'Provider',models:[{i
 function fixture() {
   const events: HostEvent[] = []
   let selected: ModelSelection = defaultModel
-  const agent: HostAgent = {id:'s',status:'idle',options:defaultModel,session:{id:'s',header:{id:'s',cwd:root},seq:0,snapshotEvents:()=>events}}
+  const agent: HostAgent = {id:'s',status:'idle',options:defaultModel,model:{current:()=>selected,select:value=>{selected=value}},session:{id:'s',header:{id:'s',cwd:root},seq:0,snapshotEvents:()=>events}}
   const services: Partial<HostServices> = {
     agents:{get:()=>agent,list:()=>[agent]},sessions:{get:()=>agent.session,list:()=>[agent.session]},
     agentDefaultModel:{currentSelection:()=>defaultModel},llm:{resolveCallConfig:async input=>input},
     sessionController:{create:async()=>({sessionId:'s'}),resolveAgent:async()=>({agent}),prompt:async()=>{},cancel:async()=>{},modelCatalog:async()=>catalog,
-      agents:{selectionFor:()=>({current:selected}),selectForNextRequest:(_agent,value)=>{selected=value},serializeImageAdmission:async(_agent,operation)=>operation()}},
+      list:async()=>({items:[{sessionId:'s',cwd:root,updatedAt:124,agentAvailable:true,projections:{values:{title:'Readable title'}}}]}),
+      agents:{serializeImageAdmission:async(_agent,operation)=>operation()}},
   }
   return {agent,events,ctx:{get:name=>services[name]} as Pick<HostContext,'get'>}
 }
@@ -79,4 +80,17 @@ test('running presentation stops on lost contact, cancellation and terminal resu
   }
   assert.deepEqual(taskStatusPresentation({ ...task, cancelRequested: true, remote: { ...task.remote!, status: 'completed' } }, false), { label: '已完成', running: false })
   assert.deepEqual(taskStatusPresentation({ ...task, submission: 'pending', remote: undefined, connectionError: 'timeout' }, false), { label: '待确认送达', running: false })
+})
+
+test('an empty cached session still presents its failed request without fabricating assistant output', () => {
+  const evidence = { id: 'task', promptRequestId: 'request', prompt: 'create hello.txt', status: 'error' as const,
+    error: 'model unavailable', errorPhase: 'startup' as const, text: '', createdAt: '2026-11-13T00:00:00Z', updatedAt: '2026-11-13T00:00:01Z', truncated: false }
+  const snapshot = { device: 'Device', deviceId: 'd', cachedAt: '2026-11-13T00:00:02Z', session: {
+    id: 's', title: 'create hello.txt', cwd: root, live: false, updatedAt: 0, messages: [], evidence: [], evidenceTruncated: false, truncated: false, tasks: [evidence],
+  } }
+  const [turn] = conversationTurns([], snapshot)
+  assert.deepEqual(turn.messages, [{ role: 'user', text: 'create hello.txt' }])
+  assert.equal(turn.task?.remote?.error, 'model unavailable')
+  assert.deepEqual(taskStatusPresentation(turn.task!, false), { label: '启动失败', running: false })
+  assert.equal(conversationTurns([turn.task!], snapshot).length, 1)
 })

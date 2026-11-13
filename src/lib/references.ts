@@ -8,7 +8,8 @@ import { revisionOf } from './evidence.js'
 import type { ResourceRequest, ResourceResult, ResourceTarget } from './resources.js'
 
 export interface ReferenceDescriptor extends ResourceTarget {
-  id: string; deviceId: string; device: string; title: string; createdAt: string
+  id: string; deviceId: string; device: string; title: string; referenceCreatedAt: string
+  sessionUpdatedAt?: number
   availability: 'online' | 'cached' | 'unavailable'; cachedAt?: string
   capabilities: string[]
 }
@@ -47,7 +48,8 @@ export async function createReferences({ store, connector }: { store: Store; con
   function describe(d: ReferenceIdentity, peer: Peer): ReferenceDescriptor {
     const cached = d.sessionId ? peer.cache?.sessions[d.sessionId] : undefined
     const scope = peer.cache!.status.scope
-    return { id: d.id, deviceId: d.deviceId, device: d.device, title: d.title, createdAt: d.createdAt,
+    return { id: d.id, deviceId: d.deviceId, device: peer.name, title: d.title, referenceCreatedAt: d.referenceCreatedAt,
+      ...(cached ? { sessionUpdatedAt: cached.updatedAt } : {}),
       kind: d.kind, workspacePath: d.workspacePath, ...(d.sessionId ? { sessionId: d.sessionId } : {}),
       availability: connector.cachedView(peer).online ? 'online' : cached ? 'cached' : 'unavailable',
       ...(cached ? { cachedAt: cached.cachedAt } : {}),
@@ -67,7 +69,7 @@ export async function createReferences({ store, connector }: { store: Store; con
     if (target.sessionId ? !session : !workspace) throw new HttpError(404, '找不到引用的资源')
     const descriptor: ReferenceIdentity = { id: randomUUID(), deviceId: peer.deviceId, device: peer.name,
       kind: session ? 'session' : 'workspace', workspacePath: session?.cwd ?? workspace!.path, ...(session ? { sessionId: session.id } : {}),
-      title: session?.title ?? workspace!.title, createdAt: new Date().toISOString() }
+      title: session?.title ?? workspace!.title, referenceCreatedAt: new Date().toISOString() }
     const entry = { descriptor, credential: revisionOf(peer.token), receipts: [] }
     if (session && !sessionInScope(session, peer.cache.status)) throw new HttpError(403, '会话正文未授权')
     await update(draft => {

@@ -27,8 +27,8 @@ export function eventSelection(events: HostEvent[]): ModelSelection | undefined 
   }
   return pending ?? used
 }
-export function currentSelection(ctx: Pick<HostContext, 'get'>, agent: HostAgent): ModelSelection | undefined {
-  return ctx.get('sessionController')?.agents.selectionFor(agent).current
+export function currentSelection(_ctx: Pick<HostContext, 'get'>, agent: HostAgent): ModelSelection | undefined {
+  return agent.model.current()
 }
 export async function executionContext(ctx: Pick<HostContext, 'get'>, workspace: string, sessionId?: string): Promise<ExecutionContext> {
   const controller = ctx.get('sessionController')
@@ -62,7 +62,7 @@ export async function selectForTask(ctx: Pick<HostContext, 'get'>, agent: HostAg
   const resolved = await resolver.resolveCallConfig(selection)
   await admission.serializeImageAdmission(agent, async () => {
     if (agent.status === 'running') throw new HttpError(409, '设备会话正在执行任务，请稍后发送')
-    admission.selectForNextRequest(agent, { provider: resolved.provider, model: resolved.model,
+    agent.model.select({ provider: resolved.provider, model: resolved.model,
       ...(resolved.reasoningEffort ? { reasoningEffort: String(resolved.reasoningEffort) } : {}) })
   })
 }

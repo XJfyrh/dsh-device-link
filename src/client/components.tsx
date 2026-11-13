@@ -3,7 +3,8 @@ import type { AccountRelation, Scope, WorkspaceFact } from '../lib/types.js'
 import type { PeerView } from '../lib/connect.js'
 import type { Diagnostic } from '../lib/network.js'
 import type { TabProps, ClientPrimitives, CreatePortal } from './contracts.js'
-import { api, message, parseAddress, parseReference, type ClientState, type Resource, type SessionSnapshot, type SentReferenceData } from './state.js'
+import { api, cacheLabel, message, openDeviceUi, parseAddress, parseReference, type ClientState, type Resource, type SessionSnapshot, type SentReferenceData } from './state.js'
+import { statusLabels } from './conversation.js'
 import { createScopeComponents } from './scope.js'
 import { createChoiceField } from './choice-field.js'
 import { createTaskComponents } from './tasks.js'
@@ -41,7 +42,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
   function ResourceIcon({ kind }: { kind: 'workspace' | 'session' | 'agent' }) {
     return <span className={`dl-resource-icon dl-resource-icon-${kind}`} aria-hidden="true">{kind === 'agent' ? <primitives.IconAgentPresetOutlineRegular size={16} /> : <primitives.ReferenceIconRegular kind={kind === 'workspace' ? 'folder' : 'session'} size={16} />}</span>
   }
-  function Status({ peer }: { peer: PeerView }) { return <span className="status"><i className={`dot ${peer.online ? 'online' : ''}`} />{peer.online ? '在线' : '离线'}</span> }
+  function Status({ peer }: { peer: PeerView }) { return <span className="status"><i className={`dot ${peer.online ? 'online' : ''}`} />{peer.checking ? '检查中…' : peer.online ? '在线' : '离线'}</span> }
   async function favorite(peer: PeerView, workspace: WorkspaceFact, enabled: boolean) {
     await api('favorite', { deviceId: peer.deviceId, path: workspace.path, enabled }); await state.refresh()
   }
@@ -63,7 +64,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
       <button className={`device-trigger ${wide ? '' : 'rail'}`} aria-label="设备" title={`${online} 台设备在线`} aria-expanded={view.panel !== null} aria-haspopup="dialog"
         onClick={() => state.change({ panel: view.panel ? null : 'list' })}>
         <DeviceIcon />
-        {wide ? <><span className="grow">设备</span><small>{online} 在线</small></> : online > 0 && <i className="dot online" aria-hidden="true" />}
+        {wide ? <><span className="grow">设备</span><small>{!view.data || view.data.peers.some(peer => peer.checking) ? '检查中…' : `${online} 在线`}</small></> : online > 0 && <i className="dot online" aria-hidden="true" />}
       </button>
     </div>
   }
@@ -114,6 +115,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
     const action = useAction()
     useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer) }, [])
     const remaining = view.data?.pairing ? Math.max(0, Math.ceil((Date.parse(view.data.pairing.expiresAt) - now) / 1000)) : 0
+    if (!view.data) return <p role="status">正在加载本机设置…</p>
     return <><LocalDeviceName />
       {view.data?.addresses.map(address => <p className="path" key={address}>{address}</p>)}
       <label><input type="checkbox" checked={view.data?.allowIncoming ?? false} disabled={action.busy} onChange={event => void action.run(async () => { await api('toggle', { allowIncoming: event.target.checked }); await state.refresh() })} />允许局域网设备连接</label>
@@ -146,10 +148,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
     const [diagnostic, setDiagnostic] = useState<Diagnostic | null>(null)
     const action = useAction()
     async function openRemote() {
-      const tab = window.open('about:blank', '_blank')
-      if (!tab) throw new Error('请允许弹窗后重试')
-      tab.opener = null
-      try { tab.location.href = (await api<{ url: string }>('open', { deviceId: peer.deviceId })).url } catch (error) { tab.close(); throw error }
+      await openDeviceUi(peer.deviceId)
     }
     if (managing) return <div className="dl-management">
       <div className="row between"><h2>{peer.name}</h2><Status peer={peer} /></div>
@@ -173,7 +172,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
       <div className="tabs" role="tablist" aria-label="设备资源">{([{ value: 'workspaces', label: '工作区', kind: 'workspace' }, { value: 'sessions', label: '会话', kind: 'session' }, { value: 'agents', label: '智能体', kind: 'agent' }] as const).map(({ value, label, kind }) => <button className="dl-resource-tab" role="tab" key={value} aria-selected={tab === value} onClick={() => setTab(value)}><ResourceIcon kind={kind} />{label}</button>)}</div>
       {tab === 'workspaces' && <>{peer.status?.host.workspaces.map(workspace => <WorkspaceRow key={workspace.id} peer={peer} workspace={workspace} />)}{!peer.status?.host.workspaces.length && <p className="empty">暂无授权工作区</p>}</>}
       {tab === 'sessions' && <>{peer.status?.host.sessions.map(session => <button className="resource-main" key={session.id} onClick={() => state.execute({ deviceId: peer.deviceId, sessionId: session.id, workspace: session.cwd, title: session.title })}>
-        <ResourceIcon kind="session" /><span className="grow"><strong>{session.title}</strong><small className="dl-meta"><span>{workspaceName(session.cwd)}</span><span>{relativeTime(session.updatedAt)}</span><span>{peer.cachedSessionIds.includes(session.id) ? '已缓存正文' : '仅会话目录'}</span></small></span><NavigationArrow />
+        <ResourceIcon kind="session" /><span className="grow"><strong>{session.title}</strong><small className="dl-meta"><span>{workspaceName(session.cwd)}</span><span>{relativeTime(session.updatedAt)}</span><span>{cacheLabel(peer, session.id)}</span></small></span><NavigationArrow />
       </button>)}{!peer.status?.host.sessions.length && <p className="empty">暂无授权会话</p>}</>}
       {tab === 'agents' && <>{peer.status?.host.agents.map(agent => <button className="resource-main" key={agent.id} onClick={() => state.execute({ deviceId: peer.deviceId, sessionId: agent.id, workspace: agent.cwd, title: agent.title ?? '新会话' })}><ResourceIcon kind="agent" /><span className="grow"><strong>{agent.title ?? '新会话'}</strong><small className="dl-meta"><span>{agent.status === 'running' ? '正在执行' : '等待下一条任务'}</span><span>{workspaceName(agent.cwd)}</span></small></span><NavigationArrow /></button>)}{!peer.status?.host.agents.length && <p className="empty">暂无活动智能体</p>}</>}
       <ErrorText text={action.error} /></>
@@ -184,27 +183,16 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
     const [managing, setManaging] = useState(false)
     const dialog = useRef<HTMLElement>(null)
     const route = view.panel
+    primitives.useModalLayer(dialog, Boolean(route && route !== 'settings'), () => state.change({ panel: null }))
     useEffect(() => setManaging(false), [route])
     useEffect(() => {
       if (!route || route === 'settings') return
-      const previous = document.activeElement as HTMLElement | null
-      dialog.current?.querySelector<HTMLElement>('button, input')?.focus()
-      function key(event: KeyboardEvent) {
-        if (event.defaultPrevented) return
-        if (event.key === 'Escape') { event.preventDefault(); state.change({ panel: null }); previous?.focus() }
-        if (event.key === 'Tab') {
-          const elements = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary') ?? [])].filter(item => item.getClientRects().length)
-          const first = elements[0], last = elements.at(-1)
-          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
-          if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
-        }
-      }
       function outside(event: PointerEvent) {
         const target = event.target as HTMLElement
         if (!dialog.current?.contains(target) && !target.closest('.device-trigger, .dl-choice-menu')) state.change({ panel: null })
       }
-      document.addEventListener('keydown', key); document.addEventListener('pointerdown', outside)
-      return () => { document.removeEventListener('keydown', key); document.removeEventListener('pointerdown', outside) }
+      document.addEventListener('pointerdown', outside)
+      return () => document.removeEventListener('pointerdown', outside)
     }, [route])
     if (!route || route === 'settings') return null
     const peer = view.data?.peers.find(item => item.deviceId === route)
@@ -213,7 +201,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
     const root = route === 'list' || route === 'all'
     const groups = peers.map(peer => ({ peer, workspaces: (peer.status?.host.workspaces ?? []).filter(workspace => `${peer.name} ${workspace.title} ${workspace.path}`.toLowerCase().includes(search)) })).filter(group => group.workspaces.length)
     const saved = (peer: PeerView, workspace: WorkspaceFact) => view.data?.favorites.some(item => item.deviceId === peer.deviceId && item.path === workspace.path)
-    return <section ref={dialog} className="dl dl-popover" role="dialog" aria-label="设备面板">
+    return <section ref={dialog} className="dl dl-popover" role="dialog" aria-modal="true" tabIndex={-1} aria-label="设备面板">
       <header className="row between"><div>{root ? <h2>设备</h2> : <button className="dl-icon-label" onClick={() => managing ? setManaging(false) : state.change({ panel: 'list' })}><primitives.IconChevronLeftOutlineRegular size={14} />{peer ? managing ? '设备资源' : '设备列表' : route === 'pair' ? '连接新设备' : '允许连接本机'}</button>}</div>
         <div className="row">{root && <button className="primary" onClick={() => state.change({ panel: 'pair' })}>＋ 连接设备</button>}<button aria-label="关闭设备面板" onClick={() => state.change({ panel: null })}>×</button></div>
       </header>
@@ -221,18 +209,19 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
       <div className="body"><ErrorText text={view.error} />{route === 'pair' && <PairForm />}{route === 'host' && <HostPairing />}{peer && <PeerDetail key={peer.deviceId} peer={peer} managing={managing} setManaging={setManaging} />}
         {route === 'list' && <>{peers.map(peer => <button className="dl-device-row" key={peer.deviceId} onClick={() => state.change({ panel: peer.deviceId })}>
           <DeviceIcon /><span className="grow"><strong>{peer.name}</strong><small className="dl-meta"><span>{peer.status?.host.workspaces.length ?? 0} 个工作区</span><span>{peer.cachedSessionIds.length} 个缓存会话</span></small></span><Status peer={peer} /><NavigationArrow />
-        </button>)}{!peers.length && <div className="empty"><p>{search ? '未找到设备' : '连接另一台设备，访问它的工作区'}</p></div>}
+        </button>)}{!peers.length && <div className="empty"><p>{!view.data ? '正在加载设备…' : search ? '未找到设备' : '连接另一台设备，访问它的工作区'}</p></div>}
         </>}
         {route === 'all' && <><Favorites query={search} />{groups.map(({ peer, workspaces }) => {
           const remaining = workspaces.filter(workspace => !saved(peer, workspace))
           return remaining.length ? <section key={peer.deviceId} className="dl-workspace-group" aria-label={`${peer.name} 的工作区`}><div className="row between"><h3 className="section-label">{peer.name}</h3><Status peer={peer} /></div>{remaining.map(workspace => <WorkspaceRow key={workspace.id} peer={peer} workspace={workspace} />)}</section> : null
-        })}{!groups.length && <p className="empty">{search ? '未找到工作区' : '连接设备后，在这里查看和收藏工作区'}</p>}</>}
+        })}{!groups.length && <p className="empty">{!view.data || peers.some(peer => peer.checking) ? '正在加载工作区…' : search ? '未找到工作区' : '连接设备后，在这里查看和收藏工作区'}</p>}</>}
       </div><footer className="row between"><button onClick={() => state.change({ panel: 'host' })}>允许连接本机</button><button onClick={() => state.change({ panel: 'settings' })}>连接设置</button></footer>
     </section>
   }
   function Settings() {
     const view = useView()
     const action = useAction()
+    if (!view.data) return <div className="dl dl-settings"><h2>设备连接设置</h2><ErrorText text={view.error} /><p role="status">正在加载本机设置…</p></div>
     return <div className="dl dl-settings"><h2>设备连接设置</h2><ErrorText text={view.error || action.error} />
       <section><LocalDeviceName /><p className="path">监听地址：{view.data?.listen?.host}:{view.data?.listen?.port}</p>
         <label><input type="checkbox" checked={view.data?.allowIncoming ?? false} disabled={action.busy} onChange={event => void action.run(async () => { await api('toggle', { allowIncoming: event.target.checked }); await state.refresh() })} />允许局域网设备连接</label>
@@ -278,7 +267,8 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
         {resource.sessionId ? <>{loading && <p className="muted">正在读取会话…</p>}
           {snapshot && <><small>缓存于 {time(snapshot.cachedAt)}{snapshot.session.truncated ? '，内容已截断' : ''}</small>
             {snapshot.session.messages.map((item, index) => <div className="message" data-role={item.role} key={item.seq ?? index} onMouseUp={event => { const selected = window.getSelection(); const text = selected?.anchorNode && event.currentTarget.contains(selected.anchorNode) && selected.focusNode && event.currentTarget.contains(selected.focusNode) ? selected.toString().slice(0, 4000) : ''; setSelectedText(text ? { text, seq: item.seq } : undefined) }}><strong>{item.role === 'user' ? '用户' : '智能体'}</strong>{item.role === 'assistant' ? <Markdown text={item.text} /> : <p>{item.text}</p>}</div>)}
-            {!snapshot.session.messages.length && <p className="empty">此会话暂无对话正文</p>}</>}
+            {!snapshot.session.messages.length && <p className="empty">此会话暂无对话正文</p>}
+            {snapshot.session.tasks?.map(task => <section key={task.id}><h3>{statusLabels[task.status]}</h3><p>{task.prompt}</p>{task.error && <p className="error">{task.error}</p>}{task.text && <Markdown text={task.text} />}{task.truncated && <small>任务记录已截断</small>}</section>)}</>}
           {peer?.online && peer.status?.scope.sessionSync === 'content' && <button className="outline" disabled={action.busy} onClick={() => void action.run(syncSession)}>更新会话缓存</button>}
         </> : <><div className="actions"><button className="primary" disabled={!peer?.online || !peer.status?.scope.allowDelegate} onClick={() => state.execute(actual)}>新建任务</button>
           <button className="outline" disabled={!peer} onClick={() => void action.run(() => state.quote(actual, sessionId))}>添加到当前任务</button>
@@ -286,7 +276,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
           {!peer?.status?.scope.allowReadFiles && <p className="dl-notice">文件读取未获授权，可在设备上调整连接授权。</p>}
           {!peer?.online && <p className="dl-notice">设备离线，可阅读已缓存会话，恢复连接后可新建任务。</p>}
           {peer?.online && !peer.status?.scope.allowDelegate && <p className="dl-notice">此工作区未授权执行任务。请在设备上调整连接授权。</p>}
-          <p className="section-label">最近会话</p>{[...recent.values()].sort((a, b) => b.updatedAt - a.updatedAt).map(item => <button className="resource-main" key={item.id} onClick={() => state.execute({ deviceId: resource.deviceId, workspace, sessionId: item.id, title: item.title })}><ResourceIcon kind="session" /><span className="grow"><strong>{item.title}</strong><small className="dl-meta"><span>{relativeTime(item.updatedAt)}</span><span>{peer?.cachedSessionIds.includes(item.id) ? '已缓存正文' : view.tasks.some(task => task.remote?.sessionId === item.id && task.deviceId === resource.deviceId) ? '任务结果可读' : '仅会话目录'}</span></small></span><NavigationArrow /></button>)}{!recent.size && <div className="empty"><p>还没有会话</p><small>从上方新建任务开始，后续可在这里继续。</small></div>}</>}
+          <p className="section-label">最近会话</p>{[...recent.values()].sort((a, b) => b.updatedAt - a.updatedAt).map(item => <button className="resource-main" key={item.id} onClick={() => state.execute({ deviceId: resource.deviceId, workspace, sessionId: item.id, title: item.title })}><ResourceIcon kind="session" /><span className="grow"><strong>{item.title}</strong><small className="dl-meta"><span>{relativeTime(item.updatedAt)}</span><span>{peer?.cachedSessionIds.includes(item.id) ? cacheLabel(peer, item.id) : view.tasks.some(task => task.remote?.sessionId === item.id && task.deviceId === resource.deviceId) ? '任务结果可读' : '仅会话目录'}</span></small></span><NavigationArrow /></button>)}{!recent.size && <div className="empty"><p>还没有会话</p><small>从上方新建任务开始，后续可在这里继续。</small></div>}</>}
       </div>{resource.sessionId && <footer><div className="actions"><button className="outline" disabled={!peer || !snapshot} onClick={() => void action.run(() => state.quote(actual, sessionId))}>添加到当前任务</button>
         {selectedText && snapshot && <button className="outline" onClick={() => void action.run(() => state.quote({ ...actual, excerpt: { ...selectedText, cachedAt: snapshot.cachedAt } }, sessionId))}>引用选中文字</button>}
         <button className="primary" disabled={!workspace} onClick={() => state.execute(actual)}>打开完整对话</button>
@@ -341,11 +331,12 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
   }
   function Overlay() {
     const view = useView()
-    return <><DevicePanel />
+    // The shell overlay sits below the native narrow-screen sidebar drawer.
+    return createPortal(<><DevicePanel />
       {view.preview && <aside className="dl dl-fallback" aria-label="设备预览"><button aria-label="关闭设备预览" style={{ position: 'absolute', right: 8, top: 8, zIndex: 1 }} onClick={() => state.change({ preview: null })}>×</button><Preview resource={view.preview} /></aside>}
       {view.panel === 'settings' && <section className="dl dl-settings-modal" role="dialog" aria-label="设备连接设置" onKeyDown={event => { if (event.key === 'Escape') state.change({ panel: null }) }}><button autoFocus aria-label="关闭连接设置" style={{ float: 'right', margin: 12 }} onClick={() => state.change({ panel: null })}>×</button><Settings /></section>}
       {view.toast && <div className="dl dl-toast" role="status">{view.toast}</div>}
-    </>
+    </>, document.body)
   }
   function PanelIcon() { return <primitives.IconChecklistOutlineRegular size={16} /> }
   return { Sidebar, Overlay, Settings, ResourceTab, ToolCard, ResourceToolRow, TasksPage, PanelIcon, SentReference }

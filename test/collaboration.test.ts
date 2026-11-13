@@ -342,6 +342,7 @@ test('on-demand transcripts outside the 200-entry directory remain available thr
     return fetch(url, options)
   } })
   const fetched = await connector.fetchSession(peer, h.archived.id)
+  assert.equal(connector.cachedView(peer).online, true)
   assert.equal(fetched.session.messages[0].text, 'offline reference text')
   const synced = await connector.sync(peer, true)
   assert.equal(synced.status?.host.sessions.length, 200)
@@ -349,6 +350,27 @@ test('on-demand transcripts outside the 200-entry directory remain available thr
   assert.equal(archivedReads, 2)
   await h.server.stop()
   assert.equal((await connector.fetchSession(peer, h.archived.id)).session.id, h.archived.id)
+})
+
+test('a slow transcript cannot hold online status or erase cached data while synchronization is pending', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  let release!: () => void
+  let entered!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const bodyStarted = new Promise<void>(resolve => { entered = resolve })
+  const connector = createConnector({ store: h.local, fetchImpl: async (url, options) => {
+    if (String(url).includes('/dl/session?')) { entered(); await gate }
+    return fetch(url, options)
+  } })
+  try {
+    const status = await connector.sync(peer, true, false)
+    await bodyStarted
+    assert.equal(status.online, true)
+    assert.equal(connector.cachedView(peer).online, true)
+    assert.deepEqual(status.cachedSessionIds, [])
+  } finally { release(); await connector.sync(peer, true) }
+  assert.ok(connector.cachedView(peer).cachedSessionIds.includes('s1'))
 })
 
 test('directory omissions revalidate cached bodies: network retains, 404 removes, 403 clears the peer', async t => {

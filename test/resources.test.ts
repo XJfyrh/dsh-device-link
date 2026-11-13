@@ -20,6 +20,23 @@ async function temporary(t: TestContext) {
   t.after(async () => { if (path.dirname(directory) !== os.tmpdir() || !path.basename(directory).startsWith('device-resource-')) throw new Error('invalid test directory'); await fs.rm(directory, { recursive: true, force: true }) })
   return directory
 }
+
+test('empty resource results distinguish an empty directory, excluded files and a missed query', async t => {
+  const root = await temporary(t)
+  const provider = createResourceProvider({ get: () => undefined })
+  const scope = defaultScope('same-account')
+  const input: ResourceRequest = { kind: 'workspace', workspacePath: root, action: 'inspect' }
+  const empty = await provider(input, scope)
+  assert.equal(empty.emptyReason, 'empty-directory')
+  assert.equal(empty.truncated, false)
+  await fs.writeFile(path.join(root, '.env'), 'private')
+  assert.equal((await provider(input, scope)).emptyReason, 'no-readable-files')
+  await fs.writeFile(path.join(root, 'source.ts'), 'export const answer = 42')
+  assert.equal((await provider({ ...input, action: 'search', query: 'not-present' }, scope)).emptyReason, 'no-matches')
+  await assert.rejects(provider(input, { ...scope, allowReadFiles: false }), { status: 403 })
+  const session: ResourceRequest = { kind: 'session', sessionId: 's1', workspacePath: root, action: 'inspect' }
+  assert.equal(queryEvidence([], session, 'device', 'now', false).emptyReason, 'no-events')
+})
 test('workspace reads enforce grants, path boundaries, file versions and text pagination', async t => {
   const directory = await temporary(t)
   const root = path.join(directory, 'work'); await fs.mkdir(root)

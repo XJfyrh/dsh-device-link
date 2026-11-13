@@ -4,7 +4,7 @@ import { constants } from 'node:fs'
 import type { HostContext } from './host.js'
 import { authorizedWorkspace, isPathAllowed, sessionAllowed } from './scope.js'
 import { evidenceEvent, hasCurrentEvidence, revisionOf } from './evidence.js'
-import { HttpError, type EvidenceEvent, type Scope, type CachedSession } from './types.js'
+import { HttpError, type EvidenceEvent, type Scope, type CachedSession, type SessionTaskEvidence } from './types.js'
 
 export interface ResourceTarget { kind: 'workspace' | 'session'; workspacePath: string; sessionId?: string }
 export interface ResourceRequest extends ResourceTarget {
@@ -24,6 +24,8 @@ export interface ResourceItem {
 export interface ResourceResult {
   action: ResourceRequest['action']; source: 'device' | 'cache'; observedAt: string
   items: ResourceItem[]; coverage: string; truncated: boolean
+  emptyReason?: 'empty-directory' | 'no-readable-files' | 'no-matches' | 'no-events'
+  tasks?: SessionTaskEvidence[]
 }
 const ignored = new Set(['.git', 'node_modules', '.env', '.dsh', '.ssh', '.aws', 'dist', '.next'])
 const excluded = (name: string) => {
@@ -69,12 +71,13 @@ export function queryEvidence(events: EvidenceEvent[], input: ResourceRequest, s
     const offset = input.action === 'search' ? Math.max(0, event.text.toLocaleLowerCase().indexOf(input.query!.trim().toLocaleLowerCase()) - 80) : 0
     return eventItem(event, false, offset)
   }), truncated: incomplete || (input.action === 'inspect' ? events.length : selected.length) > 20,
+  ...(!selected.length ? { emptyReason: !events.length ? 'no-events' as const : 'no-matches' as const } : {}),
   coverage: `${source === 'cache' ? '仅本机已缓存' : '已授权'}的对话文本${events.some(event => event.type.startsWith('tool/')) ? '与工具记录' : ''}；${incomplete ? '内容不完整，未命中不代表全部历史中不存在' : '最多返回 20 条，更多结果请缩小查询'}` }
 }
 export function queryCachedSession(session: CachedSession, input: ResourceRequest, tools: boolean): ResourceResult {
   if (!hasCurrentEvidence(session)) throw new HttpError(409, '缓存缺少事件证据，请连接设备重新同步')
   const events = session.evidence.filter(event => tools || !event.type.startsWith('tool/'))
-  return queryEvidence(events, input, 'cache', session.cachedAt, session.evidenceTruncated)
+  return { ...queryEvidence(events, input, 'cache', session.cachedAt, session.evidenceTruncated), tasks: session.tasks }
 }
 
 /** Reads beneath the authorized real root; directory links and sensitive config names are not traversed. */
@@ -167,6 +170,7 @@ async function workspaceQuery(input: ResourceRequest, scope: Scope): Promise<Res
   }
   result.truncated ||= queue.length > 0 || scanned >= 1500
   result.coverage += `；检查 ${scanned} 个条目，跳过 ${skipped} 项${result.truncated ? '；已达扫描或结果上限，请缩小范围' : ''}`
+  if (!result.items.length) result.emptyReason = scanned === 0 ? 'empty-directory' : input.action === 'search' ? 'no-matches' : 'no-readable-files'
   return result
 }
 export function createResourceProvider(ctx: Pick<HostContext, 'get'>) {

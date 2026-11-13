@@ -9,6 +9,7 @@ import { authorizedWorkspace, defaultScope, normalizeScope, sessionAllowed, isPa
 import { normalizeDeviceName } from './identity.js'
 import type { createTaskManager } from './tasks.js'
 import { parseSelection } from './models.js'
+import { shortText } from './presentation.js'
 import type { ExecutionContext } from './types.js'
 import type { ResourceRequest, ResourceResult } from './resources.js'
 import { API_VERSION, APP_VERSION, HttpError, errorMessage, type Store, type Scope, type Logger, type PairingGrant, type HostFacts, type SessionContent, type TrustedDevice } from './types.js'
@@ -79,7 +80,10 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     const current = store.state().trusted[entry.deviceId]
     if (!incomingAllowed() || !current || current.tokenHash !== entry.tokenHash || JSON.stringify(current.scope) !== JSON.stringify(entry.scope)) throw new HttpError(403, 'grant changed during read')
     return { ...facts, workspaces: facts.workspaces.filter(workspace => isPathAllowed(workspace.path, entry.scope.workspaces)),
-      sessions: facts.sessions.filter(session => sessionAllowed(session, entry.scope)),
+      sessions: facts.sessions.filter(session => sessionAllowed(session, entry.scope)).map(session => {
+        const task = taskManager?.sessionEvidence(entry, session.id)[0]
+        return task && session.title === '新会话' ? { ...session, title: shortText(task.prompt) } : session
+      }),
       agents: facts.agents.filter(agent => sessionAllowed(agent, entry.scope)) }
   }
   async function claim(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -163,7 +167,9 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       const content = await sessionProvider(url.searchParams.get('id') ?? '', entry.scope)
       await collect(entry)
       if (entry.scope.sessionSync !== 'content' || !sessionAllowed(content, entry.scope)) throw new HttpError(403, 'session is outside the grant')
-      sendJson(res, 200, { ok: true, session: content })
+      const tasks = taskManager?.sessionEvidence(entry, content.id) ?? []
+      sendJson(res, 200, { ok: true, session: { ...content, tasks,
+        title: content.title === '新会话' && tasks.length ? shortText(tasks[0].prompt) : content.title } })
       return
     }
     if (req.method === 'POST' && route === '/dl/resource') {
@@ -172,7 +178,8 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       const result = await resourceProvider(input, entry.scope)
       const current = store.state().trusted[entry.deviceId]
       if (!incomingAllowed() || !current?.active || current.tokenHash !== entry.tokenHash || JSON.stringify(current.scope) !== JSON.stringify(entry.scope)) throw new HttpError(403, 'grant changed during read', 'scope')
-      sendJson(res, 200, { ok: true, result }); return
+      const tasks = input.kind === 'session' ? taskManager?.sessionEvidence(current, input.sessionId!) : undefined
+      sendJson(res, 200, { ok: true, result: { ...result, ...(tasks ? { tasks } : {}) } }); return
     }
     if (req.method === 'POST' && route === '/dl/access') {
       requireUi(entry)
