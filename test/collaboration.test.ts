@@ -230,6 +230,33 @@ test('workspace traversal and symlink escapes are denied before delegation', asy
   assert.equal(completed.status, 'completed')
   assert.equal(h.delegates, 1)
 })
+test('workspace aliases retain task and session access without allowing symlink escapes', async t => {
+  const h = await harness(t)
+  const alias = path.join(h.home, 'workspace-alias')
+  await fs.symlink(h.workspace, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  h.session.cwd = alias
+  const scope: Scope = { ...defaultScope('different-account'), workspaces: [alias], allowDelegate: true, sessionSync: 'content' }
+  const peer = await h.pair(scope)
+  const real = await fs.realpath(h.workspace)
+  h.facts.workspaces[0].path = real
+  assert.equal((await h.connector.facts(peer)).host.workspaces.length, 1)
+  assert.equal((await h.connector.execution(peer, alias, 's1')).selected.model, 'm')
+  const task = await h.connector.startTask(peer, { requestId: 'alias-task', workspacePath: alias, sessionId: 's1', task: 'hello' })
+  assert.equal(task.workspacePath, real)
+  assert.equal((await h.connector.readTask(peer, task.id)).id, task.id)
+  assert.equal((await h.connector.execution(peer, real, 's1')).selected.model, 'm')
+  const content = await fetch(`${h.base}/dl/session?id=s1`, { headers: { authorization: `Bearer ${peer.token}` } })
+  assert.equal(content.status, 200)
+  assert.equal((await content.json()).session.tasks[0].id, task.id)
+  assert.equal((await h.connector.cancelTask(peer, task.id)).task?.id, task.id)
+  const outside = path.join(h.home, 'outside-alias')
+  await fs.mkdir(outside)
+  await fs.symlink(outside, path.join(h.workspace, 'escape-alias'), process.platform === 'win32' ? 'junction' : 'dir')
+  await assert.rejects(() => h.connector.startTask(peer, { requestId: 'escape-alias', workspacePath: path.join(alias, 'escape-alias'), task: 'escape' }), /outside/)
+  await h.server.setScope(h.local.state().identity.deviceId, { ...scope, workspaces: [outside] })
+  await assert.rejects(() => h.connector.readTask(peer, task.id), /not found/)
+})
+
 test('cached session content survives offline and store restart', async t => {
   const h = await harness(t)
   const peer = await h.pair()

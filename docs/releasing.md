@@ -4,9 +4,9 @@ npm 包名为 `dsh-device-link`，GitHub 仓库为 [XJfyrh/dsh-device-link](http
 
 ## 准备版本
 
-1. 在 `package.json`、`package-lock.json` 根条目和 `src/lib/types.ts` 的 `APP_VERSION` 中保持同一版本。
+1. 更新包版本。`package.json`、`package-lock.json` 顶层及 `packages[""]` 中的版本必须一致；同步修改 `src/lib/types.ts` 的 `APP_VERSION`。
 2. 更新 README 中的宿主兼容版本和相关操作说明。更改宿主契约时同步维护 `DESIGN.md`。
-3. 执行以下检查并查看包内文件：
+3. 在仓库根目录执行检查并查看包内文件：
 
 ```powershell
 npm ci
@@ -22,14 +22,14 @@ npm pack
 
 ## 发布 npm
 
-先确认登录账号和已发布版本：
+先确认登录账号和已发布版本。尚未登录时，运行 `npm login --registry=https://registry.npmjs.org/` 完成登录。
 
 ```powershell
 npm whoami --registry=https://registry.npmjs.org/
 npm view dsh-device-link versions --json --registry=https://registry.npmjs.org/
 ```
 
-首次发布前包名查询会返回 404。若已经存在同版本，改用新版本重新构建；npm 不能覆盖已发布的版本。
+包名尚未发布时，版本查询返回 404。若已经存在本次版本，需更换版本号并重新构建；npm 不能覆盖已发布的版本。
 
 将下例版本替换为本次版本，发布刚刚验证过的同一份安装包：
 
@@ -38,7 +38,7 @@ npm publish ./dsh-device-link-0.5.2.tgz --access public --registry=https://regis
 npm view dsh-device-link@0.5.2 version dist.integrity --registry=https://registry.npmjs.org/
 ```
 
-按 npm 提示完成账号验证。发布参数与包文件规则见 [npm publish 文档](https://docs.npmjs.com/cli/v11/commands/npm-publish/)。
+发布命令执行时，按 npm 提示完成账号验证。发布后查询应返回本次版本及包的完整性摘要。发布参数与包文件规则见 [npm publish 文档](https://docs.npmjs.com/cli/v11/commands/npm-publish/)。
 
 ## 发布 GitHub 版本
 

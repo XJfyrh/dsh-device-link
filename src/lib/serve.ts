@@ -5,7 +5,7 @@ import crypto from 'node:crypto'
 import { createDeviceToken, verifyToken, type createPairing } from './pairing.js'
 import { lanAddresses } from './config.js'
 import { readJson, sendJson } from './http.js'
-import { authorizedWorkspace, defaultScope, normalizeScope, sessionAllowed, isPathAllowed } from './scope.js'
+import { authorizedWorkspace, defaultScope, normalizeScope, sessionAllowed, isResolvedPathAllowed } from './scope.js'
 import { normalizeDeviceName } from './identity.js'
 import type { createTaskManager } from './tasks.js'
 import { parseSelection } from './models.js'
@@ -82,7 +82,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     const facts = await factsProvider(entry.scope)
     // Re-check after asynchronous host reads and enforce filtering at the wire boundary.
     checkGrant(entry)
-    return { ...facts, workspaces: facts.workspaces.filter(workspace => isPathAllowed(workspace.path, entry.scope.workspaces)),
+    return { ...facts, workspaces: facts.workspaces.filter(workspace => isResolvedPathAllowed(workspace.path, entry.scope.workspaces)),
       sessions: facts.sessions.filter(session => sessionAllowed(session, entry.scope)).map(session => {
         const task = taskManager?.sessionEvidence(entry, session.id)[0]
         return task && session.title === '新会话' ? { ...session, title: shortText(task.prompt) } : session
@@ -211,7 +211,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
           if (entry.scope.sessionSync !== 'content' || !sessionAllowed({ id: sessionId, cwd: workspacePath }, entry.scope)) throw new HttpError(403, '此会话未授权继续，请在执行设备开放该会话正文或新建任务', 'scope')
           if (!sessionProvider) throw new HttpError(503, 'session service unavailable')
           const session = await sessionProvider(sessionId, entry.scope)
-          if (session.cwd !== workspacePath) throw new HttpError(403, 'session workspace does not match')
+          if (await authorizedWorkspace(session.cwd, entry.scope) !== workspacePath) throw new HttpError(403, 'session workspace does not match')
           checkGrant(entry)
         }
       }

@@ -9,6 +9,23 @@ import { registerDeviceApi } from '../src/lib/api.ts'
 import type { HostContext } from '../src/lib/host.ts'
 import type { Runtime } from '../src/index.ts'
 
+test('long default hostnames allow initialization and saved identities ignore changed defaults', async t => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), 'device-long-name-'))
+  t.after(async () => {
+    assert.equal(path.dirname(path.resolve(home)), path.resolve(os.tmpdir()))
+    await fs.rm(home, { recursive: true, force: true })
+  })
+  t.mock.method(os, 'hostname', () => 'runner-'.repeat(20))
+  const store = await openStore({ home })
+  assert.equal(store.state().identity.name, 'runner-'.repeat(20).slice(0, 64))
+  const reopened = await openStore({ home, deviceName: 'x'.repeat(65) })
+  assert.deepEqual(reopened.state().identity, store.state().identity)
+  await assert.rejects(openStore({ home: path.join(home, 'explicit'), deviceName: 'x'.repeat(65) }), /64/)
+  t.mock.method(os, 'hostname', () => 'a'.repeat(63) + '🖥️')
+  const unicode = await openStore({ home: path.join(home, 'unicode') })
+  assert.equal(unicode.state().identity.name, 'a'.repeat(63))
+})
+
 test('owner rename API validates and durably saves the name without changing identity', async t => {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'device-name-api-'))
   const store = await openStore({ home, deviceName: 'Initial' })

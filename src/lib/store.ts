@@ -13,7 +13,7 @@ export function storeFile(home = dshHome()): string { return path.join(storeDir(
 function newState(deviceName?: string): State {
   return {
     version: STORE_VERSION,
-    identity: { deviceId: crypto.randomBytes(16).toString('hex'), name: normalizeDeviceName(deviceName || os.hostname()), createdAt: new Date().toISOString() },
+    identity: { deviceId: crypto.randomBytes(16).toString('hex'), name: normalizeDeviceName(deviceName || os.hostname().slice(0, 64).replace(/[\ud800-\udbff]$/u, '')), createdAt: new Date().toISOString() },
     serve: { port: 47654, bindAddress: 'auto', allowIncoming: true, lastAddress: '' },
     trusted: {}, peers: {}, favorites: [], incomingTasks: {}, outgoingTasks: {}, taskCancellations: {},
   }
@@ -38,7 +38,7 @@ export async function openStore({ home, log = console, deviceName }: { home?: st
   const directory = storeDir(home)
   const file = storeFile(home)
   await fs.mkdir(directory, { recursive: true })
-  let state = newState(deviceName)
+  let state: State
   let source: string | undefined
   try {
     source = await fs.readFile(file, 'utf8')
@@ -49,8 +49,9 @@ export async function openStore({ home, log = console, deviceName }: { home?: st
     try { state = parseState(source) } catch (error) {
       await fs.rename(file, `${file}.corrupt-${Date.now()}`)
       log.warn?.(`device store backed up after validation failure: ${errorMessage(error)}`)
+      state = newState(deviceName)
     }
-  }
+  } else state = newState(deviceName)
   async function save(value: State): Promise<void> {
     const temporary = `${file}.${crypto.randomUUID()}.tmp`
     try {

@@ -4,6 +4,10 @@
 
 ## 从源码运行
 
+目标宿主是 **0.2.2-rc.3**。先运行所用入口的 `--version`，确认 CLI 与桌面内置宿主的版本。安装到桌面版前，先启动一次桌面版以创建 `desktop` profile，再完全退出使用该 profile 的实例。
+
+在准备存放源码的目录执行：
+
 ```powershell
 git clone https://github.com/XJfyrh/dsh-device-link.git
 cd dsh-device-link
@@ -12,9 +16,7 @@ npm run build
 dsh plugin --profile desktop add .
 ```
 
-先启动一次桌面版创建 `desktop` profile，安装时完全退出占用该 profile 的实例，完成后重启。目标宿主是 **0.2.2-rc.3**；先运行所用入口的 `--version`，全局 CLI 和桌面内置宿主可能不同。
-
-源码安装是目录链接，开发改动后重新构建并重启。向另一台设备分发时运行 `npm pack`，安装生成的 `.tgz`。
+安装完成后重启 Harness，侧栏底部应出现 **设备**。源码安装使用目录链接，开发改动后重新构建并重启即可加载。向另一台设备分发时运行 `npm pack`，安装生成的 `.tgz`。
 
 ## 代码入口
 
@@ -32,7 +34,7 @@ dsh plugin --profile desktop add .
 
 ## 本地检查
 
-首次安装依赖运行 `npm ci`，提交前执行：
+在仓库根目录执行以下检查；新拉取源码后先运行 `npm ci`：
 
 ```powershell
 npm run typecheck
@@ -68,7 +70,7 @@ npm run test:e2e
 
 已有 Chromium 可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。浏览器覆盖设备面板、配对、收藏、引用、任务卡片、草稿恢复和窄屏；配置模型时继续验证模型切换、真实委派、按需文件和事件读取、离线引用。
 
-结果写入 `.e2e/acceptance.json`，截图和可访问性快照也在 `.e2e/`。交付说明写本次运行范围、结果和未验证项，不把历史通过次数写成当前保证。
+执行结束后检查 `.e2e/acceptance.json` 中的场景结果；浏览器截图和可访问性快照也保存在 `.e2e/`。提交说明中记录本次运行的宿主版本、验证范围、结果和未验证项。
 
 配置模型并设置 `E2E_BROWSER=1` 后，`npm run test:e2e -- --lan-followup-only` 可单独复测工作区归属、入站授权展示和原生审批的批准、拒绝流程。此模式缺少模型或浏览器配置时直接报错，不能与 `--protocol-only` 合用。审批使用隔离实例中的验收工具，不执行文件操作。
 

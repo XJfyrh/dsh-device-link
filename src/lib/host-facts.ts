@@ -1,6 +1,6 @@
 import os from 'node:os'
 import type { HostContext, HostEvent } from './host.js'
-import { isPathAllowed, sessionAllowed } from './scope.js'
+import { isPathAllowed, isResolvedPathAllowed, sessionAllowed } from './scope.js'
 import { readableTitle } from './presentation.js'
 import { parseSelection } from './models.js'
 import { cacheEvidence } from './evidence.js'
@@ -21,7 +21,7 @@ export async function collectHostFacts(ctx: Pick<HostContext, 'get'>, { scope, s
   const workspaceAccess = !scope || scope.workspaces === 'all' || scope.workspaces.length > 0
   const sessionAccess = workspaceAccess && (!scope || scope.sessionSync !== 'none' && (scope.sessionIds === 'all' || scope.sessionIds.length > 0))
   const workspaces = (workspaceAccess ? ctx.get('workspaceRegistry')?.list() ?? [] : [])
-    .filter(item => isPathAllowed(item.path, scope?.workspaces))
+    .filter(item => isResolvedPathAllowed(item.path, scope?.workspaces))
     .map(item => ({ id: item.id, path: item.path, title: item.title }))
   const sessions = new Map<string, SessionFact>()
   const controller = sessionAccess ? ctx.get('sessionController') : undefined

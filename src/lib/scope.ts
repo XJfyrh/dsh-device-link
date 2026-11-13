@@ -1,5 +1,6 @@
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
 import { HttpError, record, type Scope, type WorkspaceScope, type AccountRelation } from './types.js'
 
 export function defaultScope(relationship: AccountRelation): Scope {
@@ -49,9 +50,18 @@ export function isPathAllowed(value: unknown, allowed: WorkspaceScope = 'all'): 
   })
 }
 
+/** Host and task paths can be resolved while owner-entered grant roots retain aliases. */
+export function isResolvedPathAllowed(value: string, allowed: WorkspaceScope = 'all'): boolean {
+  if (isPathAllowed(value, allowed)) return true
+  if (allowed === 'all') return false
+  return allowed.some(base => {
+    try { return isPathAllowed(value, [realpathSync(base)]) } catch { return false }
+  })
+}
+
 /** Check real paths immediately before execution so symlinks cannot widen the grant. */
 export async function authorizedWorkspace(value: string, scope: Scope): Promise<string> {
-  if (!isPathAllowed(value, scope.workspaces)) throw new HttpError(403, 'workspace is outside the grant', 'scope')
+  if (!isResolvedPathAllowed(value, scope.workspaces)) throw new HttpError(403, 'workspace is outside the grant', 'scope')
   const resolved = await fs.realpath(value).catch(() => { throw new HttpError(400, 'workspace directory does not exist') })
   if (!(await fs.stat(resolved)).isDirectory()) throw new HttpError(400, 'workspace must be a directory')
   const allowed = scope.workspaces === 'all' ? 'all' : await Promise.all(scope.workspaces.map(base => fs.realpath(base)))
@@ -60,6 +70,6 @@ export async function authorizedWorkspace(value: string, scope: Scope): Promise<
 }
 
 export function sessionAllowed(session: { id: string; cwd: string }, scope: Scope): boolean {
-  return scope.sessionSync !== 'none' && isPathAllowed(session.cwd, scope.workspaces)
+  return scope.sessionSync !== 'none' && isResolvedPathAllowed(session.cwd, scope.workspaces)
     && (scope.sessionIds === 'all' || scope.sessionIds.includes(session.id))
 }

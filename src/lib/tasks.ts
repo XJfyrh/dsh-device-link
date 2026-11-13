@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { isPathAllowed, sessionAllowed } from './scope.js'
+import { isResolvedPathAllowed, sessionAllowed } from './scope.js'
 import { delegationEnd, delegationText, requestTurn } from './delegation.js'
 import type { HostContext } from './host.js'
 import { sameSelection } from './models.js'
@@ -52,7 +52,7 @@ export async function createTaskManager({ store, ctx, run }: {
 
   function authorized(task: StoredTask, owner: TrustedDevice): boolean {
     return task.ownerDeviceId === owner.deviceId && task.tokenHash === owner.tokenHash
-      && owner.scope.allowDelegate && isPathAllowed(task.workspacePath, owner.scope.workspaces)
+      && owner.scope.allowDelegate && isResolvedPathAllowed(task.workspacePath, owner.scope.workspaces)
   }
   function get(owner: TrustedDevice, id: string): DeviceTask {
     const task = store.state().incomingTasks[taskKey(owner.deviceId, id)]
@@ -122,7 +122,7 @@ export async function createTaskManager({ store, ctx, run }: {
       const currentGrant = draft.trusted[owner.deviceId]
       if (!draft.serve.allowIncoming || !currentGrant || currentGrant.tokenHash !== owner.tokenHash
         || JSON.stringify(currentGrant.scope) !== JSON.stringify(owner.scope)) throw new HttpError(403, 'grant changed before task admission')
-      if (!currentGrant.scope.allowDelegate || !isPathAllowed(input.workspacePath, currentGrant.scope.workspaces)) throw new HttpError(403, 'task is outside the grant')
+      if (!currentGrant.scope.allowDelegate || !isResolvedPathAllowed(input.workspacePath, currentGrant.scope.workspaces)) throw new HttpError(403, 'task is outside the grant')
       if (draft.taskCancellations[key] === owner.tokenHash) throw new HttpError(409, 'task request was cancelled')
       const existing = draft.incomingTasks[key]
       if (existing) {
