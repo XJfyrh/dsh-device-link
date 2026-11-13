@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Device link",
-    "description": "Pair a DSH device on your LAN to delegate workspace tasks and read cached sessions. Each device controls the granted scope; full UI access requires a separate grant."
+    "description": "Connect DSH devices on your LAN to delegate tasks, read authorized files and sessions, and reference cached sessions offline."
   }
 }

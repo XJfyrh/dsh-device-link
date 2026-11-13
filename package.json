@@ -1,9 +1,8 @@
 {
   "name": "dsh-device-link",
   "version": "0.5.2",
-  "private": true,
   "type": "module",
-  "description": "TypeScript LAN device pairing, scoped collaboration and offline session references for DeepSeek Harness",
+  "description": "LAN device pairing, scoped task delegation and on-demand file and session access for DeepSeek Harness",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -14,13 +13,17 @@
     "./client": "./dist/client.js"
   },
   "files": [
-    "dist",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/client.js",
+    "dist/lib/*.js",
+    "dist/lib/*.d.ts",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.png",
     "README.md",
-    "DESIGN.md",
-    "AGENTS.md"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "icon": "./icon.png",
   "engines": {
@@ -45,10 +48,34 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.check.json",
-    "build": "tsc && esbuild src/client.tsx --bundle --format=iife --outfile=dist/client.js",
+    "build": "node --import tsx scripts/clean-dist.ts && tsc && esbuild src/client.tsx --bundle --format=iife --outfile=dist/client.js",
     "test": "tsx --test --test-timeout=20000 test/*.test.ts",
     "test:e2e": "npm run build && node --env-file-if-exists=.env --import tsx scripts/e2e-two-instance.ts",
     "test:e2e:protocol": "npm run build && node --import tsx scripts/e2e-two-instance.ts --protocol-only",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "license": "MIT",
+  "author": "XJfyrh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XJfyrh/dsh-device-link.git"
+  },
+  "homepage": "https://github.com/XJfyrh/dsh-device-link#readme",
+  "bugs": {
+    "url": "https://github.com/XJfyrh/dsh-device-link/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "plugin",
+    "lan",
+    "device-link"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

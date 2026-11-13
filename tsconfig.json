@@ -10,7 +10,7 @@
     "strict": true,
     "noEmitOnError": true,
     "declaration": true,
-    "sourceMap": true,
+    "sourceMap": false,
     "rootDir": "src",
     "outDir": "dist",
     "skipLibCheck": true,
