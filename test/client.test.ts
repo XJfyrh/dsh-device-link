@@ -2,9 +2,66 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { buildSync } from 'esbuild'
-import { sentReferenceRule, createClientState, draftKey } from '../src/client/state.ts'
+import { sentReferenceRule, createClientState, draftKey, serializeReference, parseAddress, resourceAddress } from '../src/client/state.ts'
 import type { ClientContext } from '../src/client/contracts.ts'
 import type { OutgoingTask } from '../src/lib/types.ts'
+
+test('device previews reuse one tab and retain the selected receipt without closing other plugin or session tabs', () => {
+  let tabs = [
+    { sessionId: 'local', tabId: 'old1', kind: 'device-link-preview', contentId: 'old-1' },
+    { sessionId: 'local', tabId: 'old2', kind: 'device-link-preview', contentId: 'old-2' },
+    { sessionId: 'local', tabId: 'file', kind: 'file', contentId: 'file.txt' },
+    { sessionId: 'other', tabId: 'other', kind: 'device-link-preview', contentId: 'other-preview' },
+  ]
+  let activeId = 'file'
+  let serial = 0
+  const context = {
+    layout: { selectPanel() {} },
+    sidebarRight: {
+      mounted: { getSnapshot: () => 'local' }, openTabs: { getSnapshot: () => tabs },
+      active: () => { const tab = tabs.find(tab => tab.tabId === activeId); return tab && { id: tab.tabId, kind: tab.kind } },
+      close: (id: string) => { tabs = tabs.filter(tab => tab.tabId !== id) },
+      openResource(address: string, options?: { replaceTab?: string; revealIfOpened?: boolean }) {
+        const existing = options?.revealIfOpened === false ? undefined : tabs.find(tab => tab.sessionId === 'local' && tab.contentId === address)
+        if (options?.replaceTab) tabs = tabs.filter(tab => tab.tabId !== options.replaceTab)
+        if (existing && existing.tabId !== options?.replaceTab) { activeId = existing.tabId; return }
+        activeId = `new-${++serial}`
+        tabs.push({ sessionId: 'local', tabId: activeId, kind: 'device-link-preview', contentId: address })
+      },
+    },
+  } as unknown as ClientContext
+  const state = createClientState(context)
+  for (const receiptId of ['inspect', 'search', 'read', 'inspect', 'read']) {
+    state.preview({ deviceId: 'peer', workspace: '/work', title: receiptId, referenceId: 'ref', receiptId, sourceSessionId: 'local' })
+    const previews = tabs.filter(tab => tab.sessionId === 'local' && tab.kind === 'device-link-preview')
+    assert.equal(previews.length, 1)
+    assert.equal(parseAddress(previews[0].contentId).receiptId, receiptId)
+    assert.equal(parseAddress(previews[0].contentId).sourceSessionId, 'local')
+    assert.ok(tabs.some(tab => tab.tabId === 'file'))
+    assert.ok(tabs.some(tab => tab.tabId === 'other'))
+  }
+  const reference = { deviceId: 'peer', workspace: '/work', title: '工作区', referenceId: 'ref' }
+  assert.equal(parseAddress(resourceAddress(reference)).receiptId, undefined)
+})
+
+test('sending a reference includes a locator without loading session contents; excerpts stay explicit', async () => {
+  const previous = globalThis.fetch
+  const calls: string[] = []
+  globalThis.fetch = async url => {
+    calls.push(String(url))
+    return new Response(JSON.stringify({ ok: true, descriptor: { id: 'ref1', kind: 'session', sessionId: 's1', deviceId: 'peer', device: 'Lab', title: 'Decision', workspacePath: '/work', capabilities: ['搜索对话文本'], availability: 'cached', createdAt: 'now' } }))
+  }
+  try {
+    const wire = await serializeReference('device://peer/session?id=s1', new AbortController().signal)
+    assert.deepEqual(calls, ['/device-link/api/reference-prepare'])
+    const data = sentReferenceRule.match(wire, 0)!.data
+    assert.equal(data.referenceId, 'ref1'); assert.equal(data.snapshot, undefined)
+    const excerpt = { text: '决定不用 Redis', seq: 7, cachedAt: '2026-11-12T00:00:00Z' }
+    const selected = await serializeReference(`device://peer/session?id=s1&excerpt=${encodeURIComponent(JSON.stringify(excerpt))}`, new AbortController().signal)
+    assert.deepEqual(sentReferenceRule.match(selected, 0)!.data.excerpt, excerpt)
+    assert.equal(sentReferenceRule.match(selected, 0)!.data.ref, 'device://peer/session?id=s1')
+  } finally { globalThis.fetch = previous }
+})
 
 test('@ input source offers cached workspace/session references without probing an offline peer', async () => {
   const compiled = buildSync({ entryPoints: ['src/client.tsx'], bundle: true, format: 'iife', write: false }).outputFiles[0].text

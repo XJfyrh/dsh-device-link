@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { type Logger, type State, type Store, errorMessage } from './types.js'
+import { normalizeDeviceName } from './identity.js'
 
 export const STORE_VERSION = 2
 export function dshHome(): string { return process.env.DSH_HOME?.trim() || path.join(os.homedir(), '.dsh') }
@@ -12,7 +13,7 @@ export function storeFile(home = dshHome()): string { return path.join(storeDir(
 function newState(deviceName?: string): State {
   return {
     version: STORE_VERSION,
-    identity: { deviceId: crypto.randomBytes(16).toString('hex'), name: deviceName || os.hostname(), createdAt: new Date().toISOString() },
+    identity: { deviceId: crypto.randomBytes(16).toString('hex'), name: normalizeDeviceName(deviceName || os.hostname()), createdAt: new Date().toISOString() },
     serve: { port: 47654, bindAddress: 'auto', allowIncoming: true, lastAddress: '' },
     trusted: {}, peers: {}, favorites: [], incomingTasks: {}, outgoingTasks: {}, taskCancellations: {},
   }

@@ -6,6 +6,8 @@ import { diagnose } from './network.js'
 import { defaultScope, normalizeScope } from './scope.js'
 import { parseSelection } from './models.js'
 import { HttpError, errorMessage, type AccountRelation } from './types.js'
+import type { ResourceRequest } from './resources.js'
+import { renameDevice } from './identity.js'
 
 export async function statePayload(runtime: Runtime) {
   const { server, connector, store, hostFacts } = runtime
@@ -17,7 +19,7 @@ export type DeviceState = Awaited<ReturnType<typeof statePayload>>
 
 export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntime }): () => void {
   async function handle(req: IncomingMessage, res: ServerResponse, runtime: Runtime): Promise<void> {
-    const { server, connector, store, outgoingTasks } = runtime
+    const { server, connector, store, outgoingTasks, references } = runtime
     const route = new URL(req.url ?? '/', 'http://localhost').pathname.slice('/device-link/api/'.length)
     if (req.method === 'GET' && route === 'state') { sendJson(res, 200, await statePayload(runtime)); return }
     if (req.method === 'GET' && route === 'references') {
@@ -31,6 +33,11 @@ export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntim
     const body = await readJson(req)
     let result: unknown
     switch (route) {
+      case 'rename': result = { identity: await renameDevice(store, body.name) }; break
+      case 'reference-prepare': result = { descriptor: await references.prepare(String(body.deviceId ?? ''), { workspacePath: typeof body.workspacePath === 'string' ? body.workspacePath : undefined, sessionId: typeof body.sessionId === 'string' ? body.sessionId : undefined }) }; break
+      case 'reference-detail': result = references.get(String(body.referenceId ?? ''), typeof body.localSessionId === 'string' ? body.localSessionId : undefined); break
+      case 'reference-call': result = { call: references.call(String(body.localSessionId ?? ''), String(body.callId ?? '')) }; break
+      case 'reference-preview': result = { result: await references.query(String(body.referenceId ?? ''), body as Partial<ResourceRequest>) }; break
       case 'task-refresh': result = { task: await outgoingTasks.refresh(String(body.id ?? '')) }; break
       case 'task-cancel': result = { task: await outgoingTasks.cancel(String(body.id ?? '')) }; break
       case 'allow': {
@@ -56,6 +63,7 @@ export function registerDeviceApi(ctx: HostContext, { load }: { load: LoadRuntim
         const peer = connector.peerByRef(String(body.deviceId ?? ''))
         if (!peer) throw new HttpError(404, '没有这个设备')
         result = await connector.revoke(peer)
+        await references.removePeer(peer.deviceId)
         break
       }
       default: {

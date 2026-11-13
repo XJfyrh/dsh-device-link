@@ -4,7 +4,7 @@ import { HttpError, record, type Scope, type WorkspaceScope, type AccountRelatio
 
 export function defaultScope(relationship: AccountRelation): Scope {
   const same = relationship === 'same-account'
-  return { workspaces: same ? 'all' : [], allowUi: same, allowDelegate: same, sessionSync: same ? 'content' : 'none', sessionIds: 'all' }
+  return { workspaces: same ? 'all' : [], allowUi: same, allowDelegate: same, sessionSync: same ? 'content' : 'none', sessionIds: 'all', allowReadFiles: same, sessionTools: false }
 }
 
 /** An owner supplies the complete grant. A malformed value never expands access. */
@@ -27,6 +27,8 @@ export function normalizeScope(value: unknown): Scope {
     allowDelegate: input.allowDelegate,
     sessionSync: input.sessionSync as Scope['sessionSync'],
     sessionIds: input.sessionIds as Scope['sessionIds'],
+    allowReadFiles: input.allowReadFiles === true,
+    sessionTools: input.sessionTools === true && input.sessionSync === 'content',
   }
   if (scope.allowUi && (scope.workspaces !== 'all' || scope.sessionSync !== 'content' || scope.sessionIds !== 'all')) {
     throw new HttpError(400, '完整界面需要全部工作区与全部会话内容授权')

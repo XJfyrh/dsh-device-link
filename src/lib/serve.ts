@@ -6,9 +6,11 @@ import { createDeviceToken, verifyToken, type createPairing } from './pairing.js
 import { lanAddresses } from './config.js'
 import { readJson, sendJson } from './http.js'
 import { authorizedWorkspace, defaultScope, normalizeScope, sessionAllowed, isPathAllowed } from './scope.js'
+import { normalizeDeviceName } from './identity.js'
 import type { createTaskManager } from './tasks.js'
 import { parseSelection } from './models.js'
 import type { ExecutionContext } from './types.js'
+import type { ResourceRequest, ResourceResult } from './resources.js'
 import { API_VERSION, APP_VERSION, HttpError, errorMessage, type Store, type Scope, type Logger, type PairingGrant, type HostFacts, type SessionContent, type TrustedDevice } from './types.js'
 
 export interface GuiProxy {
@@ -25,10 +27,11 @@ interface ServerDependencies {
   sessionProvider?: (id: string, scope: Scope) => Promise<SessionContent>
   taskManager?: Awaited<ReturnType<typeof createTaskManager>>
   executionProvider?: (workspace: string, sessionId?: string) => Promise<ExecutionContext>
+  resourceProvider?: (input: ResourceRequest, scope: Scope) => Promise<ResourceResult>
   log?: Logger
 }
 
-export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, taskManager, executionProvider, log = console }: ServerDependencies) {
+export function createDeviceLinkServer({ config, store, pairing, proxy, factsProvider, sessionProvider, taskManager, executionProvider, resourceProvider, log = console }: ServerDependencies) {
   let listen: { host: string; port: number } | null = null
   let activePairing: (PairingGrant & { code: string; expiresAt: string }) | null = null
   const accessCodes = new Map<string, { token: string; deviceId: string; expiresAt: number }>()
@@ -89,6 +92,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     const body = await readJson(req)
     if (typeof body.deviceId !== 'string' || !/^[a-zA-Z0-9_-]{1,200}$/.test(body.deviceId) || ['__proto__', 'constructor', 'prototype'].includes(body.deviceId)) throw new HttpError(400, 'invalid deviceId')
     if (body.deviceId === store.state().identity.deviceId) throw new HttpError(400, 'cannot pair a device with itself')
+    const name = normalizeDeviceName(body.name)
     if (typeof body.code !== 'string' || !/^\d{8}$/.test(body.code)) throw new HttpError(400, '8-digit code required')
     const grant = activePairing
     const result = pairing.consume(body.code, key)
@@ -105,7 +109,7 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
     const createdAt = new Date().toISOString()
     await closeDevice(deviceId)
     await store.update(draft => {
-      draft.trusted[deviceId] = { deviceId, name: typeof body.name === 'string' ? body.name.slice(0, 120) : deviceId,
+      draft.trusted[deviceId] = { deviceId, name,
         createdAt, lastSeenAt: createdAt, active: true, tokenHash, relationship: grant.relationship, scope: grant.scope }
     })
     sendJson(res, 200, { ok: true, api: API_VERSION, ...store.state().identity, token, scope: grant.scope, relationship: grant.relationship })
@@ -140,6 +144,16 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       return
     }
     if (req.method === 'GET' && route === '/dl/status') {
+      const encodedName = req.headers['x-device-link-name']
+      if (encodedName !== undefined) {
+        let name: string
+        try { name = normalizeDeviceName(decodeURIComponent(String(encodedName))) } catch { throw new HttpError(400, '设备名称无效') }
+        if (name !== entry.name) await store.update(draft => {
+          const current = draft.trusted[entry.deviceId]
+          if (!incomingAllowed() || !current?.active || current.tokenHash !== entry.tokenHash) throw new HttpError(403, 'grant changed during sync')
+          current.name = name
+        })
+      }
       const host = await collect(entry)
       sendJson(res, 200, { ok: true, api: API_VERSION, device: { ...store.state().identity, app: 'dsh-device-link', version: APP_VERSION }, scope: entry.scope, host })
       return
@@ -151,6 +165,14 @@ export function createDeviceLinkServer({ config, store, pairing, proxy, factsPro
       if (entry.scope.sessionSync !== 'content' || !sessionAllowed(content, entry.scope)) throw new HttpError(403, 'session is outside the grant')
       sendJson(res, 200, { ok: true, session: content })
       return
+    }
+    if (req.method === 'POST' && route === '/dl/resource') {
+      if (!resourceProvider) throw new HttpError(503, 'resource service unavailable')
+      const input = await readJson(req) as unknown as ResourceRequest
+      const result = await resourceProvider(input, entry.scope)
+      const current = store.state().trusted[entry.deviceId]
+      if (!incomingAllowed() || !current?.active || current.tokenHash !== entry.tokenHash || JSON.stringify(current.scope) !== JSON.stringify(entry.scope)) throw new HttpError(403, 'grant changed during read', 'scope')
+      sendJson(res, 200, { ok: true, result }); return
     }
     if (req.method === 'POST' && route === '/dl/access') {
       requireUi(entry)

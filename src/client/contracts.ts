@@ -24,7 +24,10 @@ export interface ClientContext {
   sidebarRightTabs: { register(definition: { id: string; kind: string; patterns: string[]; title(address: string): string }): () => void }
   sidebarRight: {
     mounted: Snapshot<string | undefined>
-    openResource(address: string): unknown
+    openResource(address: string, options?: { replaceTab?: string; revealIfOpened?: boolean }): unknown
+    openTabs: Snapshot<readonly { sessionId: string; tabId: string; kind: string; contentId: string }[]>
+    active(): { id: string; kind: string } | undefined
+    close(tabId: string): void
     isExpanded(): boolean
     toggleExpanded(): void
   }
@@ -41,11 +44,17 @@ export interface TabProps {
 export interface MarkdownProps { text: string; labels: { code: { copyLabel: string; copiedLabel: string; toolbarLabels: { codeLabel: string; wrapLabel: string; unwrapLabel: string } }; footnotes: string } }
 export interface ClientPrimitives {
   MarkdownText: React.ComponentType<MarkdownProps>
+  TextShimmer: React.ComponentType<{ active?: boolean; className?: string; children?: React.ReactNode }>
   IconCopyOutlineRegular: React.ComponentType<{ size?: number }>
   IconCheckOutlineRegular: React.ComponentType<{ size?: number }>
   IconChevronRightOutlineRegular: React.ComponentType<{ size?: number }>
+  IconChevronLeftOutlineRegular: React.ComponentType<{ size?: number }>
   IconChevronDownOutlineRegular: React.ComponentType<{ size?: number }>
+  IconRightUpOutlineRegular: React.ComponentType<{ size?: number }>
   IconFolderCloseRegular: React.ComponentType<{ size?: number }>
+  ReferenceIconRegular: React.ComponentType<{ kind: 'folder' | 'session'; size?: number }>
+  IconAgentPresetOutlineRegular: React.ComponentType<{ size?: number }>
+  IconChecklistOutlineRegular: React.ComponentType<{ size?: number }>
   MenuSurface: React.ComponentType<React.ComponentPropsWithRef<'div'>>
   MenuGroup: React.ComponentType<{ label: string; children?: React.ReactNode }>
 }

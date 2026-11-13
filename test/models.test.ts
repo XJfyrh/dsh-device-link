@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import { executionContext, selectForTask, eventSelection } from '../src/lib/models.ts'
 import { collectHostFacts, eventMessages } from '../src/lib/host-facts.ts'
-import { conversationTurns } from '../src/client/conversation.ts'
+import { conversationTurns, taskStatusPresentation } from '../src/client/conversation.ts'
 import type { HostAgent, HostContext, HostEvent, HostServices } from '../src/lib/host.ts'
 import type { ModelSelection, OutgoingTask } from '../src/lib/types.ts'
 const root = path.resolve('workspace')
@@ -65,4 +65,18 @@ test('history and task results merge by request identity without hiding repeated
   assert.equal(turns.length,2)
   assert.deepEqual(turns.map(turn=>turn.messages.length),[2,2])
   assert.deepEqual(turns.map(turn=>turn.task?.id),['1','2'])
+})
+
+test('running presentation stops on lost contact, cancellation and terminal results', () => {
+  const task: OutgoingTask = { id: 'task', deviceId: 'device', deviceName: 'Device', workspacePath: root, prompt: 'work', createdAt: '', submission: 'accepted',
+    remote: { id: 'task', sessionId: 'session', workspacePath: root, prompt: 'work', status: 'running', createdAt: '', updatedAt: '', text: '' } }
+  assert.deepEqual(taskStatusPresentation(task, true), { label: '执行中', running: true })
+  assert.deepEqual(taskStatusPresentation(task, false), { label: '状态待更新', running: false })
+  assert.deepEqual(taskStatusPresentation({ ...task, connectionError: 'timeout' }, true), { label: '状态待更新', running: false })
+  assert.deepEqual(taskStatusPresentation({ ...task, cancelRequested: true }, true), { label: '正在停止', running: false })
+  for (const status of ['queued', 'stopping', 'completed', 'error', 'stopped', 'interrupted'] as const) {
+    assert.equal(taskStatusPresentation({ ...task, remote: { ...task.remote!, status } }, true).running, false)
+  }
+  assert.deepEqual(taskStatusPresentation({ ...task, cancelRequested: true, remote: { ...task.remote!, status: 'completed' } }, false), { label: '已完成', running: false })
+  assert.deepEqual(taskStatusPresentation({ ...task, submission: 'pending', remote: undefined, connectionError: 'timeout' }, false), { label: '待确认送达', running: false })
 })

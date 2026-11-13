@@ -13,6 +13,8 @@ import { createDelegationRunner } from './lib/delegation.js'
 import { createTaskManager } from './lib/tasks.js'
 import { createOutgoingTasks } from './lib/outgoing-tasks.js'
 import { executionContext } from './lib/models.js'
+import { createResourceProvider } from './lib/resources.js'
+import { createReferences } from './lib/references.js'
 import type { HostContext } from './lib/host.js'
 import type { Scope } from './lib/types.js'
 
@@ -23,7 +25,6 @@ export async function bootstrap(ctx: HostContext, rawConfig: Record<string, unkn
   const config = resolveConfig(rawConfig)
   const startedAt = Date.now()
   const store = await openStore({ deviceName: config.deviceName })
-  if (config.deviceName) await store.update(draft => { draft.identity.name = config.deviceName })
   const bind = pickBindAddress(config.bindAddress)
   const origin = ctx.webServer.getOrigin()
   const credentials = createOwnerCredentials({ origin, getAuthenticatedUrl: () => ctx.connection.authenticatedUrl(origin), log: console })
@@ -37,14 +38,16 @@ export async function bootstrap(ctx: HostContext, rawConfig: Record<string, unkn
     store, pairing, proxy, factsProvider: hostFacts,
     sessionProvider: (id, scope) => readSessionContent(ctx, id, scope),
     executionProvider: (workspace, sessionId) => executionContext(ctx, workspace, sessionId),
+    resourceProvider: createResourceProvider(ctx),
     taskManager,
   })
   const connector = createConnector({ store })
+  const references = await createReferences({ store, connector })
   const outgoingTasks = createOutgoingTasks({ store, connector })
   const listen = await server.start()
   await store.update(draft => { draft.serve.port = listen.port; draft.serve.lastAddress = listen.host })
   console.log(`[device-link] ${store.state().identity.name} listening on ${listen.host}:${listen.port}`)
-  return { config, store, server, connector, delegation, taskManager, outgoingTasks, hostFacts }
+  return { config, store, server, connector, delegation, taskManager, outgoingTasks, hostFacts, references }
 }
 export type Runtime = Awaited<ReturnType<typeof bootstrap>>
 export type LoadRuntime = () => Promise<Runtime>

@@ -3,6 +3,7 @@ import type { HostContext, HostEvent } from './host.js'
 import { isPathAllowed, sessionAllowed } from './scope.js'
 import { readableTitle } from './presentation.js'
 import { parseSelection } from './models.js'
+import { cacheEvidence } from './evidence.js'
 import { type Scope, type HostFacts, type SessionContent, type SessionFact, type SessionMessage, record, HttpError } from './types.js'
 
 export function contentText(content: unknown): string {
@@ -101,5 +102,6 @@ export async function readSessionContent(ctx: Pick<HostContext, 'get'>, id: stri
     remaining -= text.length
     bounded.unshift({ ...message, text })
   }
-  return { ...fact, messages: bounded, truncated: bounded.length < messages.length || messages.reduce((n, message) => n + message.text.length, 0) > 64_000 }
+  return { ...fact, messages: bounded, truncated: bounded.length < messages.length || messages.reduce((n, message) => n + message.text.length, 0) > 64_000,
+    ...cacheEvidence(events, scope.sessionTools === true) }
 }

@@ -3,12 +3,15 @@ import type { ClientPrimitives, CreatePortal } from './contracts.js'
 import { api, active, draftKey, message, type ClientState, type Resource, type SessionSnapshot } from './state.js'
 import type { ExecutionContext, OutgoingTask } from '../lib/types.js'
 import { relativeTime, shortText, workspaceName } from '../lib/presentation.js'
-import { conversationTurns, statusLabels } from './conversation.js'
+import { conversationTurns, statusLabels, taskStatusPresentation } from './conversation.js'
 import { createModelPicker } from './model-picker.js'
+import { nativeWhaleRestPath } from './native-running.js'
+import { createDeviceIcon } from './icons.js'
 
 export function createTaskComponents(React: typeof ReactTypes, state: ClientState, Markdown: ReactTypes.ComponentType<{ text: string }>, primitives: ClientPrimitives, createPortal: CreatePortal) {
   const { useState, useEffect, useRef, useSyncExternalStore } = React
-  const { IconCopyOutlineRegular: CopyIcon, IconCheckOutlineRegular: CheckIcon, IconChevronRightOutlineRegular: ChevronIcon, IconFolderCloseRegular: FolderIcon } = primitives
+  const DeviceIcon = createDeviceIcon(React)
+  const { IconCopyOutlineRegular: CopyIcon, IconCheckOutlineRegular: CheckIcon, IconChevronRightOutlineRegular: ChevronIcon, IconFolderCloseRegular: FolderIcon, TextShimmer } = primitives
   const useView = () => useSyncExternalStore(state.subscribe, state.getSnapshot)
   function CopyMessage({ text }: { text: string }) {
     const [copied, setCopied] = useState(false)
@@ -21,9 +24,9 @@ export function createTaskComponents(React: typeof ReactTypes, state: ClientStat
     return <article className="dl dl-task" data-task-id={task.id}>
       <button className="dl-task-link" onClick={() => state.openTask(task, source)}>
         <span className="row between"><strong className="ellipsis">{shortText(task.prompt)}</strong><span className="task-state">{statusLabels[task.remote?.status ?? task.submission]}</span></span>
-        <small className="dl-meta"><span>{task.deviceName} › {workspaceName(task.workspacePath)}</span><span>{relativeTime(task.remote?.updatedAt ?? task.createdAt)}</span></small>
+        <small className="dl-meta"><span className="dl-icon-label">{task.deviceName}<ChevronIcon size={12} />{workspaceName(task.workspacePath)}</span><span>{relativeTime(task.remote?.updatedAt ?? task.createdAt)}</span></small>
         <p className="dl-excerpt">{shortText(task.remote?.text || task.remote?.error || task.connectionError || '打开任务查看进展', 140)}</p>
-        <span className="dl-link">查看任务 ›</span>
+        <span className="dl-link dl-icon-label">查看任务<ChevronIcon size={14} /></span>
       </button>
     </article>
   }
@@ -130,8 +133,11 @@ export function createTaskComponents(React: typeof ReactTypes, state: ClientStat
       try { await state.cancelTask(task.id) } catch (cause) { setError(message(cause)) }
     }
     function turnStatus(task: OutgoingTask) {
-      return <div className="dl-turn-status" role="status"><span>{statusLabels[task.remote?.status ?? task.submission]}</span>
-        {task.cancelRequested && active(task) && <span>，正在等待执行设备确认停止</span>}
+      const status = taskStatusPresentation(task, !!peer?.online)
+      return <div className="dl-turn-status" role="status">{status.running ? <span className="dl-running-status">
+        <span className="dl-running-icon" aria-hidden="true"><span className="dl-running-whale-animated" /><svg className="dl-running-whale-still" width="100%" height="100%" viewBox="0 0 16 16" fill="none"><path d={nativeWhaleRestPath} stroke="currentColor" strokeWidth={1} /></svg></span>
+        <TextShimmer active>{status.label}</TextShimmer>
+      </span> : <span>{status.label}</span>}
         {task.connectionError && <p>{task.remote ? '暂时无法更新状态，执行设备上的任务可能仍在运行。' : task.submission === 'pending' ? '尚未确认送达，恢复连接后会核对同一次提交。' : task.connectionError}</p>}
         {task.remote?.error && <p className="error">{task.remote.error}</p>}
         {(task.connectionError || task.remote?.status === 'interrupted') && <button onClick={() => void state.refreshTask(task.id).catch(cause => setError(message(cause)))}>检查状态</button>}
@@ -139,19 +145,20 @@ export function createTaskComponents(React: typeof ReactTypes, state: ClientStat
       </div>
     }
     const sendLabel = sending ? '提交中…' : busy ? '等待当前任务结束' : sessionId ? '发送' : '开始任务'
+    const returnLabel = target?.source === 'workspace' ? '返回工作区' : target?.source === 'tasks' ? '全部任务' : '返回本地会话'
     return <main className="dl dl-conversation">
       <header className="dl-conversation-header">
-        <button className="dl-icon-button dl-back" onClick={state.back} aria-label={target?.source === 'workspace' ? '返回工作区' : target?.source === 'local' ? '返回本地会话' : '设备任务'} title={target?.source === 'workspace' ? '返回工作区' : target?.source === 'local' ? '返回本地会话' : '设备任务'}><ChevronIcon size={16} /></button>
         <h2 className="ellipsis" title={sessionTitle}>{shortText(sessionTitle, 65)}</h2>
-        <span className="dl-remote-source ellipsis" title={`${peer?.name ?? selectedTask?.deviceName ?? '连接已移除'} › ${workspaceName(resource.workspace)}`}><span className="dl-source-part"><span className="dl-device-icon" aria-hidden="true" />{peer?.name ?? selectedTask?.deviceName ?? '连接已移除'}</span><ChevronIcon size={12} /><span className="dl-source-part"><FolderIcon size={14} />{workspaceName(resource.workspace)}</span></span>
+        <span className="dl-remote-source ellipsis" title={`${workspaceName(resource.workspace)}（${peer?.name ?? selectedTask?.deviceName ?? '连接已移除'}）`}><span className="dl-source-part"><DeviceIcon size={14} />{peer?.name ?? selectedTask?.deviceName ?? '连接已移除'}</span><ChevronIcon size={12} /><span className="dl-source-part"><FolderIcon size={14} />{workspaceName(resource.workspace)}</span></span>
         <span className="status"><i className={`dot ${peer?.online ? 'online' : ''}`} />{peer?.online ? '在线' : '离线'}</span>
-        <details className="dl-context-details"><summary aria-label="任务信息" title="任务信息">信息</summary><div>
+        <details className="dl-context-details"><summary className="dl-disclosure-summary" aria-label="任务信息" title="任务信息"><ChevronIcon size={12} />信息</summary><div>
           <p>设备：{peer?.name ?? selectedTask?.deviceName ?? '执行设备'}</p><p>工作区：{workspaceName(resource.workspace)}</p><p className="path">{resource.workspace}</p>
           <small>任务与浏览器会话在 {peer?.name ?? '执行设备'} 上运行</small>
           {snapshot && <small>{peer?.online ? '会话同步于' : '正文缓存于'} {relativeTime(snapshot.cachedAt)}</small>}
           {sessionId && <small className="path">会话标识：{sessionId}</small>}
           {target?.source !== 'tasks' && <button onClick={() => state.change({ execution: null })}>全部任务</button>}
         </div></details>
+        <button className="dl-conversation-return" onClick={state.back}>{returnLabel}</button>
       </header>
       <div className="dl-transcript" ref={scroller} onScroll={() => { const node = scroller.current; if (node) { stick.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80; state.saveScroll(resource, node.scrollTop) } }}>
         <div className="dl-transcript-content">

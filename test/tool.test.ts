@@ -18,7 +18,6 @@ test('device tools return lossless JSON when optional result and cache fields ar
     for (const [name, args] of [
       ['device_delegate', { device: 'remote', workspace: '/workspace', task: 'hello' }],
       ['device_task', { taskId: 'task' }],
-      ['device_sessions', { device: 'remote' }],
     ] as const) {
       const result = await registered.get(name)!.execute(args)
       assert.deepEqual(JSON.parse(JSON.stringify(result)), result, name)

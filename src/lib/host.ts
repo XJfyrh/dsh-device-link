@@ -51,6 +51,8 @@ export interface HostServices {
   sessionQuery: {
     listSessions(): Promise<{ header: HostSession['header']; live: boolean }[]>
     readSession(id: string): Promise<{ session: HostSession['header']; events: HostEvent[] }>
+    filterEvents?(id: string, filters: ({ kind: 'text'; text: string } | { kind: 'type'; values: string[] })[]): Promise<{ seq: number; type: string; text: string }[]>
+    readEvent?(request: { sessionId: string; seq: number; before?: number; after?: number }): Promise<{ session: HostSession['header']; target: HostEvent; events: HostEvent[] }>
   }
   tools: { register(definition: ToolDefinition): () => void }
   systemPrompt: { section(definition: { name: string; order: number; text(): string }): () => void }

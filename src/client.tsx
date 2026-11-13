@@ -4,6 +4,7 @@ import { styles } from './client/styles.js'
 import type { Candidate } from './client/contracts.js'
 import type { PeerView } from './lib/connect.js'
 import { relativeTime } from './lib/presentation.js'
+import { installSettingsDeviceIcon } from './client/icons.js'
 
 window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
   const React = require('react')
@@ -18,12 +19,14 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
       return () => style.remove()
     })
     ctx.effect(() => state.start())
+    ctx.effect(installSettingsDeviceIcon)
     ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'device-link', order: 16, label: '设备连接' }, components.Settings))
     ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'device-link', order: 20 }, components.Sidebar))
     ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'device-link', order: 40 }, components.Overlay))
     ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'device-link-tasks' }, components.TasksPage))
     ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'device-link-tasks', label: '设备任务', order: 25 }, components.PanelIcon))
     ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({ name: 'tool.call.toolview', key: 'device_delegate', inject: sessionId => ({ sessionId }) }, components.ToolCard))
+    for (const key of ['device_inspect', 'device_search', 'device_read']) ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({ name: 'tool.call.toolview', key, inject: sessionId => ({ sessionId }) }, components.ResourceToolRow))
     ctx.effect(() => ctx.sidebarRightTabs.register({ id: 'device-link-preview', kind: 'device-link-preview', patterns: ['dsh-resource://device-link/**'], title(address) {
       return new URL(address).searchParams.get('title') ?? '设备资源'
     } }))
@@ -38,11 +41,11 @@ window.__ModuleLoader__.load({ id: 'dsh-device-link', factory(require) {
         for (const peer of state.peers) {
           for (const workspace of peer.status?.host.workspaces ?? []) {
             const value = reference({ deviceId: peer.deviceId, workspace: workspace.path, title: workspace.title }).ref
-            candidates.push({ name: `${peer.name} › ${workspace.title}`, label: `${peer.name} › ${workspace.title}`, description: `${peer.online ? '工作区' : '离线工作区'}：${workspace.path}`, value, icon: 'folder' })
+            candidates.push({ name: `${workspace.title}（${peer.name}）`, label: `${workspace.title}（${peer.name}）`, description: `${peer.online ? '工作区' : '离线工作区'}：${workspace.path}`, value, icon: 'folder' })
           }
           for (const session of peer.status?.host.sessions ?? []) {
             if (!peer.cachedSessionIds.includes(session.id)) continue
-            candidates.push({ name: `${peer.name} › ${session.title}`, label: `${peer.name} › ${session.title}`, description: `缓存会话，更新于 ${relativeTime(session.updatedAt || peer.cachedAt)}`, value: reference({ deviceId: peer.deviceId, sessionId: session.id, title: session.title }).ref, icon: 'session' })
+            candidates.push({ name: `${session.title}（${peer.name}）`, label: `${session.title}（${peer.name}）`, description: `缓存会话，更新于 ${relativeTime(session.updatedAt || peer.cachedAt)}`, value: reference({ deviceId: peer.deviceId, sessionId: session.id, title: session.title }).ref, icon: 'session' })
           }
         }
         const query = request.query.toLowerCase()

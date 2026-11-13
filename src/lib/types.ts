@@ -1,4 +1,4 @@
-export const APP_VERSION = '0.4.2'
+export const APP_VERSION = '0.5.0'
 export const API_VERSION = 'v2'
 
 export type WorkspaceScope = 'all' | string[]
@@ -9,6 +9,8 @@ export interface Scope {
   allowDelegate: boolean
   sessionSync: 'none' | 'metadata' | 'content'
   sessionIds: 'all' | string[]
+  allowReadFiles?: boolean
+  sessionTools?: boolean
 }
 export interface PairingGrant {
   relationship: AccountRelation
@@ -31,7 +33,8 @@ export interface ModelCatalog {
 }
 export interface ExecutionContext { catalog: ModelCatalog; selected: ModelSelection; busy: boolean }
 export interface SessionMessage { role: 'user' | 'assistant'; text: string; seq?: number; requestId?: string; turn?: number; timestamp?: number; selection?: ModelSelection }
-export interface SessionContent extends SessionFact { messages: SessionMessage[]; truncated: boolean }
+export interface EvidenceEvent { seq: number; type: string; text: string; revision: string; time?: number; truncated: boolean }
+export interface SessionContent extends SessionFact { messages: SessionMessage[]; truncated: boolean; evidence?: EvidenceEvent[]; evidenceTruncated?: boolean }
 export interface CachedSession extends SessionContent { cachedAt: string }
 export interface HostFacts {
   platform: string

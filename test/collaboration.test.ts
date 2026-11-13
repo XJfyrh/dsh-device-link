@@ -15,6 +15,7 @@ import { collectHostFacts } from '../src/lib/host-facts.ts'
 import { createTaskManager } from '../src/lib/tasks.ts'
 import type { Scope, SessionContent } from '../src/lib/types.ts'
 import { APP_VERSION, HttpError } from '../src/lib/types.ts'
+import { renameDevice } from '../src/lib/identity.ts'
 
 async function harness(t: TestContext) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'device-collaboration-'))
@@ -62,6 +63,43 @@ async function archivedHarness(t: TestContext) {
   h.facts.sessions = Array.from({ length: 200 }, (_, i) => ({ ...h.session, id: `recent-${i}` }))
   return { ...h, archived }
 }
+
+test('renames sync in both directions without changing grants and survive offline restart', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  const trustedBefore = h.server.trusted()[0]
+  await renameDevice(h.store, ' 办公室电脑 ')
+  await renameDevice(h.local, '开发笔记本')
+  const view = await h.connector.sync(peer, true)
+  assert.equal(view.name, '办公室电脑')
+  assert.equal(view.online, true)
+  assert.equal(h.local.state().peers[peer.deviceId].token, peer.token)
+  assert.deepEqual(h.server.trusted()[0], { ...trustedBefore, name: '开发笔记本' })
+  assert.equal(h.connector.peerByRef('办公室电脑')?.deviceId, peer.deviceId)
+  assert.equal(h.connector.peerByRef('remote'), undefined)
+  const renamedId = h.store.state().identity.deviceId
+  const reopenedRemote = await openStore({ home: h.home, deviceName: 'remote' })
+  assert.equal(reopenedRemote.state().identity.name, '办公室电脑')
+  assert.equal(reopenedRemote.state().identity.deviceId, renamedId)
+  await h.server.stop()
+  const reopenedLocal = await openStore({ home: path.join(h.home, 'local'), deviceName: 'local' })
+  const offline = await createConnector({ store: reopenedLocal }).sync(reopenedLocal.state().peers[peer.deviceId], true)
+  assert.equal(offline.name, '办公室电脑')
+  assert.equal(offline.online, false)
+  assert.equal(reopenedLocal.state().identity.name, '开发笔记本')
+})
+
+test('invalid or unauthenticated name announcements cannot alter a trusted device', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  const before = h.server.trusted()
+  assert.equal((await fetch(`${h.base}/dl/status`, { headers: { 'x-device-link-name': encodeURIComponent('冒名') } })).status, 401)
+  assert.equal((await fetch(`${h.base}/dl/status`, { headers: { authorization: `Bearer ${peer.token}`, 'x-device-link-name': '%E0%A4' } })).status, 400)
+  assert.deepEqual(h.server.trusted(), before)
+  const identity = h.store.state().identity
+  for (const value of ['', '   ', 'a\nb', 'a'.repeat(65), null]) await assert.rejects(renameDevice(h.store, value), HttpError)
+  assert.deepEqual(h.store.state().identity, identity)
+})
 
 test('addresses reject credentials, paths, alternate IP forms and public destinations', () => {
   assert.equal(normalizeBase('192.168.1.9:47654'), 'http://192.168.1.9:47654')
@@ -257,7 +295,7 @@ test('diagnostics distinguish address, protocol, and ready states', async t => {
   assert.equal((await diagnose('8.8.8.8')).stage, 'address')
   assert.equal((await diagnose(h.base)).stage, 'ready')
   assert.equal(updateStatus(APP_VERSION), 'current')
-  assert.equal(updateStatus('0.5.0'), 'remote-newer')
+  assert.equal(updateStatus('99.0.0'), 'remote-newer')
   assert.equal(updateStatus('0.1.0'), 'remote-older')
 })
 

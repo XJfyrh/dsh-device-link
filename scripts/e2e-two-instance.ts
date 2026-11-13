@@ -11,6 +11,8 @@ import { defaultScope } from '../src/lib/scope.js'
 import type { DeviceState } from '../src/lib/api.js'
 import type { DeviceTask, SessionContent, OutgoingTask, ExecutionContext } from '../src/lib/types.js'
 import { activeTask } from '../src/lib/tasks.js'
+import type { ReferenceDescriptor, ReadReceipt } from '../src/lib/references.js'
+import type { ResourceResult } from '../src/lib/resources.js'
 import { chromium, expect, type Page } from '@playwright/test'
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -228,10 +230,14 @@ try {
   let peerId = ''
   let cookie = ''
   let fileSessionId = ''
+  let failureSessionId = ''
+  let decisionSessionId = ''
   const executionWorkspace = path.join(root, 'remote-workspace')
   const marker = `DEVICE_FILE_${crypto.randomUUID()}`
   await fs.mkdir(executionWorkspace)
   await fs.writeFile(path.join(executionWorkspace, 'input.txt'), marker)
+  await fs.writeFile(path.join(executionWorkspace, 'invoice.test.mjs'), "import assert from 'node:assert/strict'\nconst response = { status: 401 }\nassert.equal(response.status, 200, 'DEVICE_TEST_FAILURE')\n")
+  await fs.writeFile(path.join(a.home, 'workspace', 'invoice.ts'), 'export function createInvoice(amount: number) {\n  // API_REFERENCE_OK: returns amount including 10% tax\n  return { total: amount * 1.1 };\n}\n')
   await step('two isolated Harness hosts expose typed device state', async () => {
     assert.equal(sa.identity.name, 'harness-a')
     assert.equal(sb.identity.name, 'harness-b')
@@ -261,8 +267,18 @@ try {
     await websocket(lanA, cookie)
     assert.equal((await fetch(access.url, { redirect: 'manual' })).status, 401)
   })
+  await step('workspace reference reads exact versions without adding preview to agent receipts', async () => {
+    const { descriptor } = await api<{ descriptor: ReferenceDescriptor }>(b, 'reference-prepare', { deviceId: peerId, workspacePath: path.join(a.home, 'workspace') })
+    const searched = await api<{ result: ResourceResult }>(b, 'reference-preview', { referenceId: descriptor.id, action: 'search', query: 'createInvoice' })
+    assert.equal(searched.result.items[0].path, 'invoice.ts')
+    const item = searched.result.items[0]
+    const read = await api<{ result: ResourceResult }>(b, 'reference-preview', { referenceId: descriptor.id, action: 'read', path: item.path, revision: item.revision, startLine: item.startLine })
+    assert.match(read.result.items[0].text!, /API_REFERENCE_OK/)
+    assert.equal((await api<{ receipts: ReadReceipt[] }>(b, 'reference-detail', { referenceId: descriptor.id, localSessionId: 'unrelated' })).receipts.length, 0)
+  })
   await step('persistent task admission exposes a durable remote session and outcome', async () => {
-    const result = await runTask(b, { deviceId: peerId, workspacePath: project, task: 'Reply with DEVICE_LINK_OK. Do not use tools.' }, 30_000)
+    const result = await runTask(b, { deviceId: peerId, workspacePath: project, task: '本次项目决策：当前只有单实例，先用进程内缓存，不引入 Redis；出现多实例共享需求时再调整。请不要调用工具，确认收到并附上 DEVICE_LINK_OK。' }, 30_000)
+    decisionSessionId = result.sessionId
     assert.ok(result.sessionId.startsWith('delegate-'))
     if (modelConfigured) {
       assert.equal(result.status, 'completed', result.error)
@@ -303,8 +319,21 @@ try {
       assert.ok(cached.session.messages.every(message => !message.text.includes('Current runtime context.') && !message.text.includes('<system-reminder>')))
       assert.ok(Date.parse(cached.cachedAt))
     })
-    await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: defaultScope('same-account') })
+    await api(a, 'scope', { deviceId: sb.identity.deviceId, scope: { ...defaultScope('same-account'), sessionTools: true } })
     await api(b, 'sync', { deviceId: peerId })
+    await step('native event query reads an actual failed terminal result', async () => {
+      const task = await runTask(b, { deviceId: peerId, workspacePath: executionWorkspace,
+        task: '运行 node invoice.test.mjs，不要修改文件。告诉我测试结果。' }, 120_000)
+      assert.equal(task.status, 'completed', task.error)
+      failureSessionId = task.sessionId
+      await api(b, 'sync', { deviceId: peerId })
+      const { descriptor } = await api<{ descriptor: ReferenceDescriptor }>(b, 'reference-prepare', { deviceId: peerId, sessionId: task.sessionId })
+      const searched = await api<{ result: ResourceResult }>(b, 'reference-preview', { referenceId: descriptor.id, action: 'search', query: 'DEVICE_TEST_FAILURE' })
+      const result = searched.result.items.find(item => item.type === 'tool/result')
+      assert.ok(result, 'native query must expose the authorized tool result')
+      const read = await api<{ result: ResourceResult }>(b, 'reference-preview', { referenceId: descriptor.id, action: 'read', seq: result.seq, revision: result.revision })
+      assert.match(read.result.items[0].text!, /401/)
+    })
   }
   if (modelConfigured) await step('persistent tasks survive polling retries and continue the same remote session', async () => {
     const id = crypto.randomUUID()
@@ -390,12 +419,18 @@ try {
         await page.getByRole('button', { name: /harness-a.*在线/ }).click()
         await page.getByRole('button', { name: '收藏 workspace', exact: true }).click()
         await capture(page, 'device-detail')
-        await page.getByRole('button', { name: '‹ 设备列表', exact: true }).click()
+        await page.getByRole('button', { name: '设备列表', exact: true }).click()
         await page.getByRole('tab', { name: '工作区', exact: true }).click()
         await expect(page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true })).toBeVisible()
         await page.locator('.dl-favorites').getByRole('button', { name: 'workspace harness-a', exact: true }).click()
-        await page.getByRole('button', { name: '引用工作区', exact: true }).click()
+        await page.getByRole('button', { name: '添加到当前任务', exact: true }).click()
         const composer = page.getByRole('textbox', { name: /\/ 调用指令, @ 文件或对话$/ })
+        await expect(composer).toContainText('harness-a › workspace')
+        await page.getByRole('button', { name: '浏览资料', exact: true }).click()
+        await expect(page.locator('.dl-reference-panel').getByRole('button', { name: '返回工作区', exact: true })).toBeVisible()
+        await page.getByRole('button', { name: '返回工作区', exact: true }).click()
+        await expect(page.getByRole('button', { name: '新建任务', exact: true })).toBeVisible()
+        await expect(page.getByRole('button', { name: '浏览资料', exact: true })).toBeVisible()
         await expect(composer).toContainText('harness-a › workspace')
         await capture(page, 'workspace-preview-reference')
         await page.reload()
@@ -408,6 +443,38 @@ try {
         await page.getByRole('option').filter({ hasText: path.join(a.home, 'workspace') }).first().click()
         await expect(composer).toContainText('harness-a › workspace')
         if (modelConfigured) {
+          await composer.press('End')
+          await composer.pressSequentially(' 请分析 createInvoice 接口，说明输入、返回值，以及金额为 100 时的结果。')
+          await page.getByRole('button', { name: '发送消息', exact: true }).click()
+          await expect.poll(async () => (await api<DeviceState>(b, 'state')).host.agents.some(agent => agent.status === 'running'), { timeout: 120_000 }).toBe(false)
+          await expect(page.locator('.dl-resource-tool').filter({ hasText: '读取 invoice.ts' }).first()).toBeAttached({ timeout: 120_000 })
+          await expect(page.getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0, { timeout: 120_000 })
+          await expect(page.getByText(/110/).last()).toBeVisible()
+          await page.locator('.dl-reference').last().click()
+          await page.locator('.dl-reference-panel').getByRole('button', { name: 'invoice.ts', exact: true }).click()
+          await expect(page.locator('.dl-source-text')).toContainText('createInvoice')
+          await capture(page, 'reference-agent-receipts')
+          console.log('PASS natural prompt: agent reads interface code without user naming tools')
+          const closeResource = page.getByRole('button', { name: '收起右侧边栏', exact: true })
+          if (await closeResource.isVisible()) await closeResource.click()
+          await page.getByRole('button', { name: '新建会话', exact: true }).first().click()
+          await expect(page.getByRole('button', { name: '标准模式', exact: true })).toBeVisible()
+          const failureTitle = (await api<DeviceState>(b, 'state')).peers.find(peer => peer.deviceId === peerId)!.status!.host.sessions.find(session => session.id === failureSessionId)!.title
+          await composer.fill('@harness-a')
+          await page.getByRole('option').filter({ hasText: failureTitle }).click()
+          await composer.press('End')
+          await composer.pressSequentially(' 这次测试为什么失败？')
+          await page.getByRole('button', { name: '发送消息', exact: true }).click()
+          await expect(page.locator('.dl-resource-tool').first()).toBeAttached({ timeout: 120_000 })
+          await expect(page.getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0, { timeout: 120_000 })
+          await expect.poll(async () => (await api<DeviceState>(b, 'state')).host.agents.some(agent => agent.status === 'running'), { timeout: 120_000 }).toBe(false)
+          await capture(page, 'reference-failed-task')
+          await expect(page.getByText(/401/).last()).toBeVisible()
+          console.log('PASS natural prompt: agent retrieves failure evidence without user naming tools')
+          await page.getByRole('button', { name: '新建会话', exact: true }).first().click()
+          await expect(page.getByRole('button', { name: '标准模式', exact: true })).toBeVisible()
+          await composer.fill('@harness-a')
+          await page.getByRole('option').filter({ hasText: path.join(a.home, 'workspace') }).first().click()
           await composer.press('End')
           await composer.pressSequentially(' 请调用 device_delegate 在引用的设备和工作区委派任务，让对方设备回复 WORKSPACE_MENTION_OK。')
           await page.getByRole('button', { name: '发送消息', exact: true }).click()
@@ -480,20 +547,26 @@ try {
           stop(a.child)
           await api(b, 'sync', { deviceId: peerId })
           await page.getByRole('button', { name: '新建会话', exact: true }).first().click()
-          const cachedTitle=(await api<DeviceState>(b,'state')).peers.find(peer=>peer.deviceId===peerId)!.status!.host.sessions.find(session=>session.id===fileSessionId)!.title
+          await expect(page.getByRole('button', { name: '标准模式', exact: true })).toBeVisible()
+          const cachedTitle=(await api<DeviceState>(b,'state')).peers.find(peer=>peer.deviceId===peerId)!.status!.host.sessions.find(session=>session.id===decisionSessionId)!.title
           await composer.fill('@harness-a')
           await page.getByRole('option').filter({ hasText: cachedTitle }).click()
           await composer.press('End')
-          await composer.pressSequentially(' 设备当前离线。请从引用的会话缓存中找出此前回复中的 DEVICE_FILE_ 标识并原样回复。')
+          await composer.pressSequentially(' 我们当时为什么没用 Redis？')
           await page.getByRole('button', { name: '发送消息', exact: true }).click()
-          await expect(page.getByText(marker, { exact: true }).first()).toBeVisible({ timeout: 120_000 })
+          await expect(page.locator('.dl-resource-tool').first()).toBeAttached({ timeout: 120_000 })
+          await expect(page.getByRole('button', { name: '停止生成', exact: true })).toHaveCount(0, { timeout: 120_000 })
+          await expect(page.getByText(/单实例/).last()).toBeVisible()
           await expect.poll(async () => (await api<DeviceState>(b, 'state')).host.agents.some(agent => agent.status === 'running'), { timeout: 120_000 }).toBe(false)
           await expect(page.locator('.dl-reference')).toHaveCount(1)
           await capture(page, 'offline-session-reference')
           await page.locator('.dl-reference').click()
-          await expect(page.getByRole('complementary', { name: '设备预览' })).toContainText(marker)
-          await capture(page, 'sent-session-snapshot')
-          await page.getByRole('button', { name: '关闭设备预览', exact: true }).click()
+          await expect(page.locator('.dl-reference-panel')).toContainText('设备离线，正在浏览缓存')
+          await expect(page.locator('.dl-reference-panel')).toContainText('Redis')
+          await capture(page, 'offline-reference-receipts')
+          console.log('PASS natural prompt: agent reviews cached decision while source device is offline')
+          const closeReference = page.getByRole('button', { name: '收起右侧边栏', exact: true })
+          if (await closeReference.isVisible()) await closeReference.click()
           a = await start('a', listenA.port)
           await api(b, 'sync', { deviceId: peerId })
         }

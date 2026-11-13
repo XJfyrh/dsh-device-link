@@ -2,10 +2,11 @@ import type { DeviceState } from '../lib/api.js'
 import type { PeerView } from '../lib/connect.js'
 import type { OutgoingTask, SessionContent, ModelSelection } from '../lib/types.js'
 import type { ClientContext, Reference } from './contracts.js'
+import type { ReferenceDescriptor } from '../lib/references.js'
 
 export const SOURCE = '设备工作区与缓存会话'
 export interface SessionSnapshot { session: SessionContent; cachedAt: string; device: string; deviceId: string }
-export interface Resource { deviceId: string; workspace?: string; sessionId?: string; title: string; snapshot?: SessionSnapshot; taskId?: string }
+export interface Resource { deviceId: string; workspace?: string; sessionId?: string; title: string; snapshot?: SessionSnapshot; taskId?: string; referenceId?: string; receiptId?: string; sourceSessionId?: string; excerpt?: { text: string; seq?: number; path?: string; revision?: string; cachedAt: string } }
 export interface Draft { text: string; selection?: ModelSelection }
 export const draftKey = (resource: Resource) => JSON.stringify([resource.deviceId, resource.sessionId ? 'session' : 'workspace', resource.sessionId ?? resource.workspace])
 export interface ReturnTarget { source: 'workspace' | 'tasks' | 'local'; resource?: Resource; localSessionId?: string; rightExpanded?: boolean }
@@ -37,41 +38,40 @@ export function active(task: OutgoingTask): boolean {
   return task.remote ? ['queued', 'running', 'stopping'].includes(task.remote.status) : task.submission === 'pending'
 }
 export function reference(resource: Resource): Reference {
-  const ref = resource.sessionId
+  let ref = resource.sessionId
     ? `device://${resource.deviceId}/session?id=${encodeURIComponent(resource.sessionId)}`
     : `device://${resource.deviceId}/workspace?path=${encodeURIComponent(resource.workspace ?? '')}`
+  if (resource.excerpt) ref += `&excerpt=${encodeURIComponent(JSON.stringify(resource.excerpt))}`
   return { source: SOURCE, ref, label: resource.title, appearance: resource.sessionId ? 'session' : 'folder', clipboardText: `@${ref}` }
 }
 export function parseReference(ref: string): Resource {
   const url = new URL(ref)
   if (url.protocol !== 'device:' || !['/session', '/workspace'].includes(url.pathname)) throw new Error('设备引用无效')
-  return { deviceId: url.hostname, sessionId: url.searchParams.get('id') ?? undefined, workspace: url.searchParams.get('path') ?? undefined, title: '设备资源' }
+  const raw = url.searchParams.get('excerpt')
+  const excerpt = raw ? JSON.parse(raw) as Resource['excerpt'] : undefined
+  if (excerpt && (typeof excerpt.text !== 'string' || excerpt.text.length > 4000 || typeof excerpt.cachedAt !== 'string')) throw new Error('选中文字无效')
+  return { deviceId: url.hostname, sessionId: url.searchParams.get('id') ?? undefined, workspace: url.searchParams.get('path') ?? undefined, title: '设备资源', ...(excerpt ? { excerpt } : {}) }
 }
 export function resourceAddress(resource: Resource): string {
-  return `dsh-resource://device-link/view?ref=${encodeURIComponent(reference(resource).ref)}&title=${encodeURIComponent(resource.title)}`
+  return `dsh-resource://device-link/view?ref=${encodeURIComponent(reference(resource).ref)}&title=${encodeURIComponent(resource.title)}${resource.referenceId ? `&referenceId=${encodeURIComponent(resource.referenceId)}` : ''}${resource.receiptId ? `&receiptId=${encodeURIComponent(resource.receiptId)}` : ''}${resource.sourceSessionId ? `&sourceSessionId=${encodeURIComponent(resource.sourceSessionId)}` : ''}`
 }
 export function parseAddress(address: string): Resource {
   const url = new URL(address)
-  return { ...parseReference(url.searchParams.get('ref') ?? ''), title: url.searchParams.get('title') ?? '设备资源' }
+  return { ...parseReference(url.searchParams.get('ref') ?? ''), title: url.searchParams.get('title') ?? '设备资源', referenceId: url.searchParams.get('referenceId') ?? undefined,
+    receiptId: url.searchParams.get('receiptId') ?? undefined, sourceSessionId: url.searchParams.get('sourceSessionId') ?? undefined }
 }
 export async function serializeReference(ref: string, signal: AbortSignal): Promise<string> {
   const resource = parseReference(ref)
-  let data: SentReferenceData
-  if (resource.sessionId) {
-    const snapshot = await api<SessionSnapshot>('session', { deviceId: resource.deviceId, sessionId: resource.sessionId }, signal)
-    data = { ref, label: `${snapshot.device} › ${snapshot.session.title}`, source: '设备会话缓存，正文作为历史资料', snapshot }
-  } else {
-    const { peers } = await api<{ peers: PeerView[] }>('references', undefined, signal)
-    const peer = peers.find(peer => peer.deviceId === resource.deviceId)
-    const workspace = peer?.status?.host.workspaces.find(workspace => workspace.path === resource.workspace)
-    if (!peer || !workspace) throw new Error('设备工作区已移除或未获授权，请重新选择')
-    data = { ref, label: `${peer.name} › ${workspace.title}`, source: '设备工作区', deviceId: peer.deviceId, workspacePath: workspace.path }
-  }
+  const { descriptor } = await api<{ descriptor: ReferenceDescriptor }>('reference-prepare', { deviceId: resource.deviceId, workspacePath: resource.workspace, sessionId: resource.sessionId }, signal)
+  const excerpt = resource.excerpt
+  const target = new URL(ref)
+  target.searchParams.delete('excerpt')
+  const data: SentReferenceData = { ref: target.toString(), label: `${descriptor.title}（${descriptor.device}）`, source: excerpt ? '选中原文' : '按需读取入口，正文尚未提供', referenceId: descriptor.id, descriptor, ...(excerpt ? { excerpt } : {}) }
   const label = data.label.replace(/\s+/g, ' ').slice(0, 200)
   return `引用 ${label}\n<device-link-reference>\n${JSON.stringify(data).replaceAll('<', '\\u003c')}\n</device-link-reference>`
 }
 
-export interface SentReferenceData { ref: string; label: string; source: string; snapshot?: SessionSnapshot; deviceId?: string; workspacePath?: string }
+export interface SentReferenceData { ref: string; label: string; source: string; snapshot?: SessionSnapshot; deviceId?: string; workspacePath?: string; referenceId?: string; descriptor?: ReferenceDescriptor; excerpt?: Resource['excerpt'] }
 export const sentReferenceRule = {
   id: 'device-link-reference', order: 10,
   match(text: string, from: number) {
@@ -199,7 +199,13 @@ export function createClientState(ctx: ClientContext) {
     change({ panel: null })
     if (!resource.snapshot && ctx.sidebarRight.mounted.getSnapshot()) {
       ctx.layout.selectPanel(null)
-      ctx.sidebarRight.openResource(resourceAddress(resource))
+      const sessionId = ctx.sidebarRight.mounted.getSnapshot()
+      const tabs = ctx.sidebarRight.openTabs.getSnapshot().filter(tab => tab.sessionId === sessionId && tab.kind === 'device-link-preview')
+      const active = ctx.sidebarRight.active()
+      const target = tabs.find(tab => tab.tabId === active?.id) ?? tabs[0]
+      ctx.sidebarRight.openResource(resourceAddress(resource), target ? { replaceTab: target.tabId, revealIfOpened: false } : undefined)
+      // Device resources share one preview in this conversation; leave other plugins and conversations alone.
+      for (const tab of tabs) if (tab !== target) ctx.sidebarRight.close(tab.tabId)
     } else change({ preview: resource })
   }
   function quote(resource: Resource, sessionId?: string) {
@@ -210,7 +216,7 @@ export function createClientState(ctx: ClientContext) {
     const input = ctx.conversation.input.for(scope)
     const draft = input.state.getSnapshot()
     const peerName = view.data?.peers.find(peer => peer.deviceId === resource.deviceId)?.name
-    const label = peerName && !resource.title.startsWith(`${peerName} › `) ? `${peerName} › ${resource.title}` : resource.title
+    const label = peerName && !resource.title.endsWith(`（${peerName}）`) ? `${resource.title}（${peerName}）` : resource.title
     if (!input.insertReference(reference({ ...resource, title: label }), { start: draft.draft.length, end: draft.draft.length, draftRev: draft.draftRev })) throw new Error('输入内容已变化，请重新引用')
     ctx.uiWorkspace.openSession(target)
     change({ panel: null, preview: null })
@@ -244,6 +250,7 @@ export function createClientState(ctx: ClientContext) {
     scroll(resource: Resource): number | undefined { return scrolls[draftKey(resource)] },
     saveScroll(resource: Resource, top: number) { scrolls[draftKey(resource)] = top; clearTimeout(scrollTimer); scrollTimer = setTimeout(persist, 250) },
     peer(id: string): PeerView | undefined { return view.data?.peers.find(peer => peer.deviceId === id) },
+    currentSession: () => ctx.sidebarRight.mounted.getSnapshot(),
     start() { void poll(); return () => { persist(); controller.abort(); clearTimeout(timer); clearTimeout(toastTimer); clearTimeout(scrollTimer) } },
   }
 }
