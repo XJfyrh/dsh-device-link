@@ -39,7 +39,7 @@ test('facts merge live and historical sessions, apply workspace and session filt
   const ctx = context({
     workspaceRegistry: { list: () => [{ id: 'root', path: root, title: 'root' }, { id: 'outside', path: path.resolve('outside'), title: 'outside' }] },
     sessions: { list: () => [current], get: () => current },
-    sessionQuery: { listSessions: async () => [{ header: current.header, live: true }, { header: session('cold').header, live: false }], readSession: async () => ({ session: current.header, events: [] }) },
+    sessionQuery: { listSessions: async () => [{ header: current.header, live: true }, { header: session('cold').header, live: false }], readSession: async () => ({ session: current.header, events: [] }), readEvent: async () => { throw new Error('unexpected event read') } },
     agents: { list: () => [{ id: 'live', session: current, status: 'running', options: { model: 'remote-model' } }], get: () => undefined },
   })
   const scope = { ...defaultScope('different-account'), workspaces: [root], sessionSync: 'metadata' as const, sessionIds: ['live', 'cold'] }
@@ -85,6 +85,7 @@ test('archived content uses sessionQuery without resuming its agent', async () =
   const ctx = context({ sessionQuery: {
     listSessions: async () => [{ header: cold.header, live: false }],
     readSession: async () => ({ session: cold.header, events: [{ type: 'assistant/message', seq: 0, data: { message: { content: [{ type: 'text', text: 'history' }] } } }] }),
+    readEvent: async () => { throw new Error('unexpected event read') },
   } })
   assert.equal((await readSessionContent(ctx, 'cold', defaultScope('same-account'))).messages[0].text, 'history')
 })
@@ -97,6 +98,7 @@ test('content reads target an authorized archive outside the first 200 sessions'
       reads.push(id)
       return { session: session(id).header, events: [{ type: 'assistant/message', seq: 0, data: { message: { content: 'old answer' } } }] }
     },
+    readEvent: async () => { throw new Error('unexpected event read') },
   } })
   const content = await readSessionContent(ctx, 'archive-200', defaultScope('same-account'))
   assert.equal(content.messages[0].text, 'old answer')
@@ -110,7 +112,7 @@ test('content reads target an authorized archive outside the first 200 sessions'
 test('archive reads distinguish missing sessions from persistence failures', async () => {
   const missing = Object.assign(new Error('not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
   let failure = missing
-  const ctx = context({ sessionQuery: { listSessions: async () => [], readSession: async () => { throw failure } } })
+  const ctx = context({ sessionQuery: { listSessions: async () => [], readSession: async () => { throw failure }, readEvent: async () => { throw new Error('unexpected event read') } } })
   await assert.rejects(() => readSessionContent(ctx, 'missing', defaultScope('same-account')), { status: 404 })
   failure = Object.assign(new Error('disk read failed'), { code: 'SESSION_QUERY_PERSISTENCE_FAILED' })
   await assert.rejects(() => readSessionContent(ctx, 'missing', defaultScope('same-account')), error => error === failure)

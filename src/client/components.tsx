@@ -45,13 +45,13 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
   async function favorite(peer: PeerView, workspace: WorkspaceFact, enabled: boolean) {
     await api('favorite', { deviceId: peer.deviceId, path: workspace.path, enabled }); await state.refresh()
   }
-  function WorkspaceRow({ peer, workspace, showDevice = false }: { peer: PeerView; workspace: WorkspaceFact; showDevice?: boolean }) {
+  function WorkspaceRow({ peer, workspace }: { peer: PeerView; workspace: WorkspaceFact }) {
     const view = useView()
     const action = useAction()
     const saved = view.data?.favorites.some(item => item.deviceId === peer.deviceId && item.path === workspace.path)
     return <div><div className="resource-row">
       <button className="resource-main" onClick={() => state.preview({ deviceId: peer.deviceId, workspace: workspace.path, title: workspace.title })}>
-        <ResourceIcon kind="workspace" /><span className="grow"><strong>{workspace.title}</strong><small title={workspace.path}>{showDevice ? peer.name : workspace.path}</small></span>
+        <ResourceIcon kind="workspace" /><span className="grow"><strong>{workspace.title}</strong><small title={workspace.path}>{workspace.path}</small></span>
       </button>
       <button className={`star ${saved ? 'selected' : ''}`} aria-label={`${saved ? '取消收藏' : '收藏'} ${workspace.title}`} disabled={action.busy} onClick={() => void action.run(() => favorite(peer, workspace, !saved))}>{saved ? '★' : '☆'}</button>
     </div><ErrorText text={action.error} /></div>
@@ -247,22 +247,21 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
   function ResourcePreview({ resource, sessionId }: { resource: Resource; sessionId?: string }) {
     const view = useView()
     const peer = view.data?.peers.find(peer => peer.deviceId === resource.deviceId)
-    const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(resource.snapshot ?? null)
+    const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null)
     const [loading, setLoading] = useState(false)
     const [loadError, setLoadError] = useState('')
     const [selectedText, setSelectedText] = useState<{ text: string; seq?: number }>()
     const action = useAction()
     const hasCache = peer?.cachedSessionIds.includes(resource.sessionId ?? '')
     useEffect(() => {
-      setSnapshot(resource.snapshot ?? null); setLoadError('')
-      if (resource.snapshot) return
+      setSnapshot(null); setLoadError(''); setSelectedText(undefined); setLoading(false)
       if (!resource.sessionId) return
       const controller = new AbortController()
       setLoading(true)
       api<SessionSnapshot>('session', { deviceId: resource.deviceId, sessionId: resource.sessionId, refresh: !hasCache && peer?.online && peer.status?.scope.sessionSync === 'content' }, controller.signal)
         .then(setSnapshot).catch(error => { if (!controller.signal.aborted) setLoadError(message(error)) }).finally(() => { if (!controller.signal.aborted) setLoading(false) })
       return () => controller.abort()
-    }, [resource.deviceId, resource.sessionId, resource.snapshot, hasCache])
+    }, [resource.deviceId, resource.sessionId, hasCache])
     const workspace = snapshot?.session.cwd ?? resource.workspace
     const actual = { ...resource, workspace, title: snapshot?.session.title ?? resource.title }
     const sessions = peer?.status?.host.sessions.filter(item => item.cwd === workspace) ?? []
@@ -280,7 +279,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
           {snapshot && <><small>缓存于 {time(snapshot.cachedAt)}{snapshot.session.truncated ? '，内容已截断' : ''}</small>
             {snapshot.session.messages.map((item, index) => <div className="message" data-role={item.role} key={item.seq ?? index} onMouseUp={event => { const selected = window.getSelection(); const text = selected?.anchorNode && event.currentTarget.contains(selected.anchorNode) && selected.focusNode && event.currentTarget.contains(selected.focusNode) ? selected.toString().slice(0, 4000) : ''; setSelectedText(text ? { text, seq: item.seq } : undefined) }}><strong>{item.role === 'user' ? '用户' : '智能体'}</strong>{item.role === 'assistant' ? <Markdown text={item.text} /> : <p>{item.text}</p>}</div>)}
             {!snapshot.session.messages.length && <p className="empty">此会话暂无对话正文</p>}</>}
-          {peer?.online && !resource.snapshot && peer.status?.scope.sessionSync === 'content' && <button className="outline" disabled={action.busy} onClick={() => void action.run(syncSession)}>更新会话缓存</button>}
+          {peer?.online && peer.status?.scope.sessionSync === 'content' && <button className="outline" disabled={action.busy} onClick={() => void action.run(syncSession)}>更新会话缓存</button>}
         </> : <><div className="actions"><button className="primary" disabled={!peer?.online || !peer.status?.scope.allowDelegate} onClick={() => state.execute(actual)}>新建任务</button>
           <button className="outline" disabled={!peer} onClick={() => void action.run(() => state.quote(actual, sessionId))}>添加到当前任务</button>
           <button className="outline" disabled={!peer?.status?.scope.allowReadFiles} onClick={() => void action.run(async () => { const result = await api<{ descriptor: { id: string } }>('reference-prepare', { deviceId: resource.deviceId, workspacePath: workspace }); state.preview({ ...actual, referenceId: result.descriptor.id }) })}>浏览资料</button></div>
@@ -288,7 +287,7 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
           {!peer?.online && <p className="dl-notice">设备离线，可阅读已缓存会话，恢复连接后可新建任务。</p>}
           {peer?.online && !peer.status?.scope.allowDelegate && <p className="dl-notice">此工作区未授权执行任务。请在设备上调整连接授权。</p>}
           <p className="section-label">最近会话</p>{[...recent.values()].sort((a, b) => b.updatedAt - a.updatedAt).map(item => <button className="resource-main" key={item.id} onClick={() => state.execute({ deviceId: resource.deviceId, workspace, sessionId: item.id, title: item.title })}><ResourceIcon kind="session" /><span className="grow"><strong>{item.title}</strong><small className="dl-meta"><span>{relativeTime(item.updatedAt)}</span><span>{peer?.cachedSessionIds.includes(item.id) ? '已缓存正文' : view.tasks.some(task => task.remote?.sessionId === item.id && task.deviceId === resource.deviceId) ? '任务结果可读' : '仅会话目录'}</span></small></span><NavigationArrow /></button>)}{!recent.size && <div className="empty"><p>还没有会话</p><small>从上方新建任务开始，后续可在这里继续。</small></div>}</>}
-      </div>{!resource.snapshot && resource.sessionId && <footer><div className="actions"><button className="outline" disabled={!peer || !snapshot} onClick={() => void action.run(() => state.quote(actual, sessionId))}>添加到当前任务</button>
+      </div>{resource.sessionId && <footer><div className="actions"><button className="outline" disabled={!peer || !snapshot} onClick={() => void action.run(() => state.quote(actual, sessionId))}>添加到当前任务</button>
         {selectedText && snapshot && <button className="outline" onClick={() => void action.run(() => state.quote({ ...actual, excerpt: { ...selectedText, cachedAt: snapshot.cachedAt } }, sessionId))}>引用选中文字</button>}
         <button className="primary" disabled={!workspace} onClick={() => state.execute(actual)}>打开完整对话</button>
       </div></footer>}
@@ -300,10 +299,9 @@ export function createComponents(React: typeof ReactTypes, state: ClientState, p
   }
   function SentReference({ node, interactive }: { node: { data: SentReferenceData }; interactive: boolean }) {
     const data = node.data
-    const device = data.descriptor?.device ?? data.snapshot?.device
-    const title = data.descriptor?.title ?? data.snapshot?.session.title
+    const { device, title, kind } = data.descriptor
     return <span className="dl"><button className="dl-reference" disabled={!interactive} title={data.excerpt ? '已附选中原文' : '按需读取的设备资料'}
-      onClick={() => state.preview({ ...parseReference(data.ref), title: data.label, snapshot: data.snapshot, referenceId: data.referenceId, excerpt: data.excerpt })}><ResourceIcon kind={data.descriptor?.kind === 'session' || data.snapshot ? 'session' : 'workspace'} /> {device && title ? <>{device}<span className="dl-inline-chevron" aria-hidden="true"><primitives.IconChevronRightOutlineRegular size={12} /></span>{title}</> : data.label}{data.excerpt ? '（原文）' : ''}</button></span>
+      onClick={() => state.preview({ ...parseReference(data.ref), title: data.label, referenceId: data.referenceId, excerpt: data.excerpt })}><ResourceIcon kind={kind} /> {device}<span className="dl-inline-chevron" aria-hidden="true"><primitives.IconChevronRightOutlineRegular size={12} /></span>{title}{data.excerpt ? '（原文）' : ''}</button></span>
   }
   function ResourceToolRow({ callId, sessionId, phase, block, inspect }: { callId: string; sessionId: string; phase: string; block: { isError?: boolean; error?: { message?: string } }; inspect?: () => void }) {
     const [call, setCall] = useState<{ descriptor: ReferenceDescriptor; receipt: ReadReceipt } | null>(null)

@@ -60,7 +60,7 @@ test('durable titles and request identities survive history projection',async()=
 })
 test('history and task results merge by request identity without hiding repeated text',()=>{
   const task = (id:string,request:string):OutgoingTask=>({id,deviceId:'d',deviceName:'Device',workspacePath:root,prompt:'repeat',createdAt:'2026-11-10T01:00:00Z',submission:'accepted',remote:{id,sessionId:'s',workspacePath:root,prompt:'repeat',promptRequestId:request,status:'completed',createdAt:'',updatedAt:'2026-11-10T01:01:00Z',text:'answer'}})
-  const snapshot={device:'Device',deviceId:'d',cachedAt:'2026-11-10T01:02:00Z',session:{id:'s',title:'Title',cwd:root,live:true,updatedAt:1,truncated:false,messages:[{seq:1,requestId:'r1',role:'user' as const,text:'repeat'},{seq:2,requestId:'r1',role:'assistant' as const,text:'answer'},{seq:3,requestId:'r2',role:'user' as const,text:'repeat'},{seq:4,requestId:'r2',role:'assistant' as const,text:'answer'}]}}
+  const snapshot={device:'Device',deviceId:'d',cachedAt:'2026-11-10T01:02:00Z',session:{id:'s',title:'Title',cwd:root,live:true,updatedAt:1,truncated:false,evidence:[],evidenceTruncated:false,messages:[{seq:1,requestId:'r1',role:'user' as const,text:'repeat'},{seq:2,requestId:'r1',role:'assistant' as const,text:'answer'},{seq:3,requestId:'r2',role:'user' as const,text:'repeat'},{seq:4,requestId:'r2',role:'assistant' as const,text:'answer'}]}}
   const turns=conversationTurns([task('1','r1'),task('2','r2')],snapshot)
   assert.equal(turns.length,2)
   assert.deepEqual(turns.map(turn=>turn.messages.length),[2,2])

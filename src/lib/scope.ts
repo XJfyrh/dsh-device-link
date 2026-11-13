@@ -14,8 +14,9 @@ export function normalizeScope(value: unknown): Scope {
   if (workspaces !== 'all' && (!Array.isArray(workspaces) || !workspaces.every(item => typeof item === 'string' && path.isAbsolute(item)))) {
     throw new HttpError(400, 'workspaces must be all or an array of absolute paths')
   }
-  if (typeof input.allowUi !== 'boolean' || typeof input.allowDelegate !== 'boolean') {
-    throw new HttpError(400, 'allowUi and allowDelegate must be boolean')
+  if (typeof input.allowUi !== 'boolean' || typeof input.allowDelegate !== 'boolean'
+    || typeof input.allowReadFiles !== 'boolean' || typeof input.sessionTools !== 'boolean') {
+    throw new HttpError(400, 'allowUi, allowDelegate, allowReadFiles and sessionTools must be boolean')
   }
   if (!['none', 'metadata', 'content'].includes(String(input.sessionSync))) throw new HttpError(400, 'invalid sessionSync')
   if (input.sessionIds !== 'all' && (!Array.isArray(input.sessionIds) || !input.sessionIds.every(id => typeof id === 'string' && id.length > 0))) {
@@ -27,8 +28,8 @@ export function normalizeScope(value: unknown): Scope {
     allowDelegate: input.allowDelegate,
     sessionSync: input.sessionSync as Scope['sessionSync'],
     sessionIds: input.sessionIds as Scope['sessionIds'],
-    allowReadFiles: input.allowReadFiles === true,
-    sessionTools: input.sessionTools === true && input.sessionSync === 'content',
+    allowReadFiles: input.allowReadFiles,
+    sessionTools: input.sessionTools && input.sessionSync === 'content',
   }
   if (scope.allowUi && (scope.workspaces !== 'all' || scope.sessionSync !== 'content' || scope.sessionIds !== 'all')) {
     throw new HttpError(400, '完整界面需要全部工作区与全部会话内容授权')

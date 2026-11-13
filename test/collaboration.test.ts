@@ -16,6 +16,7 @@ import { createTaskManager } from '../src/lib/tasks.ts'
 import type { Scope, SessionContent } from '../src/lib/types.ts'
 import { APP_VERSION, HttpError } from '../src/lib/types.ts'
 import { renameDevice } from '../src/lib/identity.ts'
+import { revisionOf } from '../src/lib/evidence.ts'
 
 async function harness(t: TestContext) {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), 'device-collaboration-'))
@@ -23,7 +24,8 @@ async function harness(t: TestContext) {
   await fs.mkdir(workspace)
   const store = await openStore({ home, deviceName: 'remote' })
   const local = await openStore({ home: path.join(home, 'local'), deviceName: 'local' })
-  const session: SessionContent = { id: 's1', cwd: workspace, title: 'cached session', updatedAt: 1, live: true, messages: [{ role: 'assistant', text: 'offline reference text' }], truncated: false }
+  const session: SessionContent = { id: 's1', cwd: workspace, title: 'cached session', updatedAt: 1, live: true,
+    messages: [{ role: 'assistant', seq: 0, text: 'offline reference text' }], truncated: false, evidence: [], evidenceTruncated: false }
   const sessionContents = new Map([[session.id, session]])
   const facts = await collectHostFacts({ get: () => undefined })
   facts.workspaces = [{ id: 'workspace', title: 'workspace', path: workspace }]
@@ -37,10 +39,10 @@ async function harness(t: TestContext) {
   const server = createDeviceLinkServer({ config: { port: 0, bindAddress: '127.0.0.1' }, store, pairing: createPairing(),
     proxy: { handle(_req, res) { res.end('GUI') }, handleUpgrade(_req, socket) { socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n') } },
     factsProvider: async () => facts,
-    sessionProvider: async id => {
+    sessionProvider: async (id, scope) => {
       const content = sessionContents.get(id)
       if (!content) throw new HttpError(404, 'session is unavailable')
-      return content
+      return { ...content, evidence: content.evidence.filter(event => scope.sessionTools || !event.type.startsWith('tool/')) }
     },
     taskManager,
     executionProvider: async () => ({catalog:{default:{provider:'p',model:'m'},groups:[],failures:[]},selected:{provider:'p',model:'m'},busy:false}),
@@ -127,6 +129,25 @@ test('unknown account relation starts with an empty grant and never enables full
   assert.equal(defaultScope('different-account').allowUi, false)
   assert.throws(() => normalizeScope({ workspaces: 'all' }), /boolean/)
   assert.throws(() => normalizeScope({ ...defaultScope('same-account'), workspaces: [process.cwd()] }), /完整界面/)
+})
+
+test('new grants require explicit file and tool permissions', () => {
+  for (const field of ['allowReadFiles', 'sessionTools']) {
+    for (const value of [undefined, null, 'true', 1]) {
+      assert.throws(() => normalizeScope({ ...defaultScope('same-account'), [field]: value }), /must be boolean/)
+    }
+  }
+  assert.equal(normalizeScope({ ...defaultScope('different-account'), sessionTools: true }).sessionTools, false)
+})
+
+test('status responses must carry the current permission fields', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  const status = await h.connector.facts(peer)
+  for (const field of ['allowReadFiles', 'sessionTools']) {
+    const connector = createConnector({ store: h.local, fetchImpl: async () => Response.json({ ...status, scope: { ...status.scope, [field]: undefined } }) })
+    await assert.rejects(() => connector.facts(peer), /protocol mismatch/)
+  }
 })
 test('restricted token cannot bypass allowUi using Bearer, cookie, access code or websocket', async t => {
   const h = await harness(t)
@@ -425,4 +446,64 @@ test('an on-demand body cannot commit after a concurrent sync observes reduced s
   release()
   await assert.rejects(pending, /授权已变更/)
   assert.throws(() => connector.cachedSession(peer, h.archived.id), /尚未缓存/)
+})
+
+test('a late transcript cannot restore tool evidence after a concurrent grant reduction', async t => {
+  const h = await archivedHarness(t)
+  const peer = await h.pair({ ...defaultScope('same-account'), sessionTools: true })
+  h.archived.evidence = [
+    { seq: 0, type: 'assistant/message', text: 'public answer', revision: revisionOf('public answer'), truncated: false },
+    { seq: 1, type: 'tool/result', text: 'private tool result', revision: revisionOf('private tool result'), truncated: false },
+  ]
+  let signalRead!: () => void
+  const reading = new Promise<void>(resolve => { signalRead = resolve })
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const connector = createConnector({ store: h.local, log: { warn() {} }, fetchImpl: async (url, options) => {
+    const response = await fetch(url, options)
+    if (String(url).endsWith('/dl/session?id=archived')) { signalRead(); await gate }
+    return response
+  } })
+  const pending = connector.fetchSession(peer, h.archived.id)
+  await reading
+  await h.server.setScope(h.local.state().identity.deviceId, { ...defaultScope('same-account'), sessionTools: false })
+  await connector.sync(peer, true)
+  release()
+  assert.deepEqual((await pending).session.evidence.map(event => event.type), ['assistant/message'])
+  assert.deepEqual(h.local.state().peers[peer.deviceId].cache!.sessions[h.archived.id].evidence.map(event => event.type), ['assistant/message'])
+  await h.server.stop()
+  assert.deepEqual(connector.cachedSession(peer, h.archived.id).session.evidence.map(event => event.type), ['assistant/message'])
+})
+
+test('incomplete or malformed evidence is rejected before it enters the cache', async t => {
+  const h = await harness(t)
+  const peer = await h.pair()
+  const status = await h.connector.facts(peer)
+  const valid = { seq: 0, type: 'assistant/message', text: 'answer', revision: revisionOf('answer'), truncated: false }
+  for (const evidence of [undefined, [{ ...valid, seq: -1 }], [{ ...valid, revision: 'not-a-revision' }], [{ ...valid, type: 'request/header' }]]) {
+    const connector = createConnector({ store: h.local, log: { warn() {} }, fetchImpl: async url => String(url).endsWith('/dl/status')
+      ? Response.json(status) : Response.json({ ok: true, session: { ...h.session, evidence } }) })
+    await assert.rejects(() => connector.fetchSession(peer, h.session.id), /invalid session content/)
+    assert.equal(h.local.state().peers[peer.deviceId].cache!.sessions[h.session.id], undefined)
+  }
+})
+
+test('sync replaces invalid cached evidence with an authorized fresh read', async t => {
+  const h = await archivedHarness(t)
+  const peer = await h.pair()
+  await h.connector.sync(peer, true)
+  for (const damage of ['missing', 'malformed']) {
+    await h.local.update(draft => {
+      const cached = { ...h.archived, cachedAt: '2026-01-01T00:00:00.000Z' }
+      if (damage === 'missing') Reflect.deleteProperty(cached, 'evidence')
+      else cached.evidence = [{ seq: -1, type: 'assistant/message', text: 'invalid', revision: revisionOf('invalid'), truncated: false }]
+      draft.peers[peer.deviceId].cache!.sessions[h.archived.id] = cached
+    })
+    assert.throws(() => h.connector.cachedSession(peer, h.archived.id), { status: 409 })
+    const view = await h.connector.sync(peer, true)
+    assert.equal(view.online, true)
+    const repaired = h.connector.cachedSession(peer, h.archived.id)
+    assert.deepEqual(repaired.session.evidence, h.archived.evidence)
+    assert.notEqual(repaired.cachedAt, '2026-01-01T00:00:00.000Z')
+  }
 })

@@ -1,6 +1,6 @@
 # dsh-device-link
 
-连接局域网内的 DeepSeek Harness 设备，向对方授权的工作区委派任务、查看会话，并在对方离线时引用已缓存的正文。任务使用执行设备的模型、工具和权限配置；获得完整界面授权后，也可以打开该设备的 Harness。
+连接局域网内的 DeepSeek Harness 设备，按需搜索和读取已授权的文件与会话，向工作区委派任务，并在对方离线时引用已缓存的正文。任务使用执行设备的模型、工具和权限配置；获得完整界面授权后，也可以打开该设备的 Harness。
 
 使用说明见下文；实现与协议见 [DESIGN.md](DESIGN.md)，开发和验证见 [AGENTS.md](AGENTS.md)。
 
@@ -113,6 +113,8 @@ dsh plugin --profile desktop add E:/dsh-device-link
 
 状态文件是 `$DSH_HOME/device-link/devices-v2.json`；未设置 `DSH_HOME` 时位于用户主目录的 `.dsh` 下，包含配对关系、令牌、收藏、任务和缓存。读取器要求完整的当前顶层结构，不补齐旧格式。解析或结构错误先保存 `.corrupt-时间戳` 备份，再创建新的设备身份，需要重新配对；文件访问或备份失败则报错并保留原文件。
 
+资源入口和读取记录保存在同目录的 `references.json`。在面板或命令中断开设备都会删除该设备的入口和记录。
+
 ```powershell
 npm run typecheck
 npm test
@@ -120,4 +122,4 @@ npm run build
 npm run test:e2e:protocol
 ```
 
-最后一项启动两个隔离 Harness，验证真实宿主的配对、代理、持久化任务失败回传、授权和缓存，不配置模型凭据。真实模型与浏览器验证方法见 [AGENTS.md](AGENTS.md#双实例验证)。本次运行结果写入 `.e2e/acceptance.json`。
+最后一项启动两个隔离 Harness，验证真实宿主的配对、代理、文件引用读取、持久化任务失败回传、授权和缓存，不配置模型凭据。真实模型与浏览器验证方法见 [AGENTS.md](AGENTS.md#双实例验证)。运行结果写入 `.e2e/acceptance.json`。

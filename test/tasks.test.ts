@@ -91,7 +91,7 @@ test('restart reconciles durable completion without submitting again', async t =
     id: 'job', ownerDeviceId: 'owner', tokenHash: 'token', sessionId: 'session', workspacePath: h.directory,
     prompt: 'hello', promptRequestId: 'device-link-job', resume: false, baselineSeq: 0, status: 'running', text: '', createdAt: '', updatedAt: '',
   } })
-  const services: Partial<HostServices> = { sessionQuery: { listSessions: async () => [], readSession: async () => ({ session: { id: 'session', cwd: h.directory }, events }) } }
+  const services: Partial<HostServices> = { sessionQuery: { listSessions: async () => [], readSession: async () => ({ session: { id: 'session', cwd: h.directory }, events }), readEvent: async () => { throw new Error('unexpected event read') } } }
   const restarted = await createTaskManager({ store: h.store, ctx: { get: name => services[name] }, run: async () => { throw new Error('must not run') } })
   assert.equal(restarted.get(h.owner, 'job').status, 'completed')
   assert.equal(restarted.get(h.owner, 'job').text, 'right')

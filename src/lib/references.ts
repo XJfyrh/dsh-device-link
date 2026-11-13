@@ -3,7 +3,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { createConnector } from './connect.js'
 import { sessionInScope } from './connect.js'
-import { HttpError, type Store } from './types.js'
+import { HttpError, type Store, type Peer } from './types.js'
 import { revisionOf } from './evidence.js'
 import type { ResourceRequest, ResourceResult, ResourceTarget } from './resources.js'
 
@@ -16,7 +16,8 @@ export interface ReadReceipt {
   id: string; localSessionId: string; callId: string; createdAt: string
   action: ResourceRequest['action']; query?: string; result: ResourceResult
 }
-interface StoredReference { descriptor: ReferenceDescriptor; credential: string; receipts: ReadReceipt[] }
+type ReferenceIdentity = Omit<ReferenceDescriptor, 'availability' | 'cachedAt' | 'capabilities'>
+interface StoredReference { descriptor: ReferenceIdentity; credential: string; receipts: ReadReceipt[] }
 export async function createReferences({ store, connector }: { store: Store; connector: ReturnType<typeof createConnector> }) {
   const filename = path.join(store.directory, 'references.json')
   let entries: Record<string, StoredReference> = {}
@@ -43,27 +44,37 @@ export async function createReferences({ store, connector }: { store: Store; con
     if (d.kind === 'workspace' && !status.host.workspaces.some(workspace => workspace.path === d.workspacePath)) throw new HttpError(403, '工作区授权已变更')
     return { entry, peer }
   }
+  function describe(d: ReferenceIdentity, peer: Peer): ReferenceDescriptor {
+    const cached = d.sessionId ? peer.cache?.sessions[d.sessionId] : undefined
+    const scope = peer.cache!.status.scope
+    return { id: d.id, deviceId: d.deviceId, device: d.device, title: d.title, createdAt: d.createdAt,
+      kind: d.kind, workspacePath: d.workspacePath, ...(d.sessionId ? { sessionId: d.sessionId } : {}),
+      availability: connector.cachedView(peer).online ? 'online' : cached ? 'cached' : 'unavailable',
+      ...(cached ? { cachedAt: cached.cachedAt } : {}),
+      capabilities: d.kind === 'session' ? ['搜索对话文本', '读取事件原文', ...(scope.sessionTools ? ['读取工具调用与结果'] : [])]
+        : [...(scope.allowReadFiles ? ['搜索当前文件', '按行读取文本文件'] : []), ...(scope.allowDelegate ? ['另行委派任务到此工作区'] : [])] }
+  }
+  function resultAllowed(d: ReferenceIdentity, peer: Peer, result: ResourceResult): boolean {
+    const scope = peer.cache!.status.scope
+    return (d.kind !== 'workspace' || scope.allowReadFiles === true)
+      && (scope.sessionTools === true || !result.items.some(item => item.type?.startsWith('tool/')))
+  }
   async function prepare(deviceId: string, target: { workspacePath?: string; sessionId?: string }) {
     const peer = connector.peerByRef(deviceId)
     if (!peer?.cache) throw new HttpError(404, '设备资源尚未同步')
     const session = target.sessionId ? peer.cache.sessions[target.sessionId] ?? peer.cache.status.host.sessions.find(session => session.id === target.sessionId) : undefined
     const workspace = peer.cache.status.host.workspaces.find(item => item.path === target.workspacePath)
     if (target.sessionId ? !session : !workspace) throw new HttpError(404, '找不到引用的资源')
-    const view = connector.cachedView(peer)
-    const descriptor: ReferenceDescriptor = { id: randomUUID(), deviceId: peer.deviceId, device: peer.name,
+    const descriptor: ReferenceIdentity = { id: randomUUID(), deviceId: peer.deviceId, device: peer.name,
       kind: session ? 'session' : 'workspace', workspacePath: session?.cwd ?? workspace!.path, ...(session ? { sessionId: session.id } : {}),
-      title: session?.title ?? workspace!.title, createdAt: new Date().toISOString(), availability: view.online ? 'online' : session && peer.cache.sessions[session.id] ? 'cached' : 'unavailable',
-      ...(session && peer.cache.sessions[session.id] ? { cachedAt: peer.cache.sessions[session.id].cachedAt } : {}),
-      capabilities: session ? ['搜索对话文本', '读取事件原文', ...(peer.cache.status.scope.sessionTools ? ['读取工具调用与结果'] : [])] : [
-        ...(peer.cache.status.scope.allowReadFiles ? ['搜索当前文件', '按行读取文本文件'] : []), ...(peer.cache.status.scope.allowDelegate ? ['另行委派任务到此工作区'] : [])] }
+      title: session?.title ?? workspace!.title, createdAt: new Date().toISOString() }
     const entry = { descriptor, credential: revisionOf(peer.token), receipts: [] }
-    // Validate before persistence without exposing the private connection credential.
     if (session && !sessionInScope(session, peer.cache.status)) throw new HttpError(403, '会话正文未授权')
     await update(draft => {
       if (store.state().peers[peer.deviceId]?.token !== peer.token) throw new HttpError(403, '设备连接已变更')
       draft[descriptor.id] = entry
     })
-    return descriptor
+    return describe(descriptor, authorized(descriptor.id).peer)
   }
   async function query(id: string, options: Partial<ResourceRequest>, execution?: { localSessionId: string; callId: string }) {
     const { entry, peer } = authorized(id)
@@ -74,13 +85,13 @@ export async function createReferences({ store, connector }: { store: Store; con
     const result = await connector.resource(peer, input)
     function checkResult() {
       const { peer: current } = authorized(id)
-      if (d.kind === 'workspace' && !current.cache?.status.scope.allowReadFiles || !current.cache?.status.scope.sessionTools && result.items.some(item => item.type?.startsWith('tool/'))) throw new HttpError(403, '读取授权已变更')
+      if (!resultAllowed(d, current, result)) throw new HttpError(403, '读取授权已变更')
     }
     checkResult()
     if (execution) await update(draft => {
       checkResult()
       const receipts = draft[id].receipts
-      const receipt: ReadReceipt = { id: randomUUID(), ...execution, createdAt: new Date().toISOString(), action: input.action, query: input.query, result }
+      const receipt: ReadReceipt = { id: randomUUID(), ...execution, createdAt: new Date().toISOString(), action: input.action, query: input.query, result: structuredClone(result) }
       receipts.push(receipt)
       // A bounded local audit is separate from the Host's durable tool history.
       if (receipts.length > 80) receipts.splice(0, receipts.length - 80)
@@ -92,23 +103,18 @@ export async function createReferences({ store, connector }: { store: Store; con
       for (const [id, value] of Object.entries(entries)) {
         const receipt = value.receipts.find(item => item.localSessionId === localSessionId && item.callId === callId)
         if (!receipt) continue
-        try { const { peer } = authorized(id); if (value.descriptor.kind === 'workspace' && !peer.cache?.status.scope.allowReadFiles || !peer.cache?.status.scope.sessionTools && receipt.result.items.some(item => item.type?.startsWith('tool/'))) continue }
+        try {
+          const { peer } = authorized(id)
+          if (resultAllowed(value.descriptor, peer, receipt.result)) return { descriptor: describe(value.descriptor, peer), receipt: structuredClone(receipt) }
+        }
         catch { continue }
-        return { descriptor: value.descriptor, receipt }
       }
       return null
     },
     get(id: string, localSessionId?: string) {
       const { entry, peer } = authorized(id)
-      const tools = peer.cache?.status.scope.sessionTools === true
       const d = entry.descriptor
-      const cached = d.sessionId ? peer.cache?.sessions[d.sessionId] : undefined
-      const descriptor: ReferenceDescriptor = { ...d, availability: connector.cachedView(peer).online ? 'online' : cached ? 'cached' : 'unavailable',
-        ...(cached ? { cachedAt: cached.cachedAt } : {}), capabilities: d.kind === 'session' ? ['搜索对话文本', '读取事件原文', ...(tools ? ['读取工具调用与结果'] : [])] : [
-          ...(peer.cache?.status.scope.allowReadFiles ? ['搜索当前文件', '按行读取文本文件'] : []), ...(peer.cache?.status.scope.allowDelegate ? ['另行委派任务到此工作区'] : [])] }
-      return { descriptor, receipts: entry.receipts.filter(receipt => receipt.localSessionId === localSessionId)
-        .filter(() => d.kind !== 'workspace' || peer.cache?.status.scope.allowReadFiles)
-        .filter(receipt => tools || !receipt.result.items.some(item => item.type?.startsWith('tool/'))) }
+      return { descriptor: describe(d, peer), receipts: structuredClone(entry.receipts.filter(receipt => receipt.localSessionId === localSessionId && resultAllowed(d, peer, receipt.result))) }
     },
     async removePeer(deviceId: string) { await update(draft => { for (const [id, value] of Object.entries(draft)) if (value.descriptor.deviceId === deviceId) delete draft[id] }) },
   }

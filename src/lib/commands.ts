@@ -10,7 +10,7 @@ export function registerDeviceCommands(ctx: HostContext, { load }: { load: LoadR
     input: { hint: 'status | allow | pair <地址> <配对码> | diagnose <地址> | list | trusted | open <设备> | sync <设备> | session <设备> <会话> | delegate 设备 | 工作区 | 任务 | tasks | task <任务 id> | cancel <任务 id> | revoke <设备> | untrust <设备>' },
     async handler({ rawInput }) {
       try {
-        const { store, server, connector, outgoingTasks } = await load()
+        const { store, server, connector, outgoingTasks, references } = await load()
         const input = rawInput.trim()
         const [command = 'status', ...args] = (input || 'status').split(/\s+/)
         let result: unknown
@@ -50,7 +50,10 @@ export function registerDeviceCommands(ctx: HostContext, { load }: { load: LoadR
             if (!peer) throw new Error('没有这个设备，先使用 /device list')
             if (command === 'open') result = await connector.access(peer)
             else if (command === 'sync') result = await connector.sync(peer, true)
-            else if (command === 'revoke') result = await connector.revoke(peer)
+            else if (command === 'revoke') {
+              result = await connector.revoke(peer)
+              await references.removePeer(peer.deviceId)
+            }
             else if (command === 'session') result = connector.cachedSession(peer, args.at(-1) ?? '')
             else throw new Error('未知设备命令')
           }

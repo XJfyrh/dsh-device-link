@@ -6,7 +6,7 @@ import type { ReferenceDescriptor } from '../lib/references.js'
 
 export const SOURCE = '设备工作区与缓存会话'
 export interface SessionSnapshot { session: SessionContent; cachedAt: string; device: string; deviceId: string }
-export interface Resource { deviceId: string; workspace?: string; sessionId?: string; title: string; snapshot?: SessionSnapshot; taskId?: string; referenceId?: string; receiptId?: string; sourceSessionId?: string; excerpt?: { text: string; seq?: number; path?: string; revision?: string; cachedAt: string } }
+export interface Resource { deviceId: string; workspace?: string; sessionId?: string; title: string; taskId?: string; referenceId?: string; receiptId?: string; sourceSessionId?: string; excerpt?: { text: string; seq?: number; path?: string; revision?: string; cachedAt: string } }
 export interface Draft { text: string; selection?: ModelSelection }
 export const draftKey = (resource: Resource) => JSON.stringify([resource.deviceId, resource.sessionId ? 'session' : 'workspace', resource.sessionId ?? resource.workspace])
 export interface ReturnTarget { source: 'workspace' | 'tasks' | 'local'; resource?: Resource; localSessionId?: string; rightExpanded?: boolean }
@@ -46,11 +46,22 @@ export function reference(resource: Resource): Reference {
 }
 export function parseReference(ref: string): Resource {
   const url = new URL(ref)
-  if (url.protocol !== 'device:' || !['/session', '/workspace'].includes(url.pathname)) throw new Error('设备引用无效')
+  const sessionId = url.searchParams.get('id') ?? undefined
+  const workspace = url.searchParams.get('path') ?? undefined
+  const validTarget = url.pathname === '/session' ? sessionId && workspace === undefined : url.pathname === '/workspace' && workspace && sessionId === undefined
+  if (url.protocol !== 'device:' || !url.hostname || !validTarget) throw new Error('设备引用无效')
   const raw = url.searchParams.get('excerpt')
-  const excerpt = raw ? JSON.parse(raw) as Resource['excerpt'] : undefined
-  if (excerpt && (typeof excerpt.text !== 'string' || excerpt.text.length > 4000 || typeof excerpt.cachedAt !== 'string')) throw new Error('选中文字无效')
-  return { deviceId: url.hostname, sessionId: url.searchParams.get('id') ?? undefined, workspace: url.searchParams.get('path') ?? undefined, title: '设备资源', ...(excerpt ? { excerpt } : {}) }
+  const excerpt = parseExcerpt(raw === null ? undefined : JSON.parse(raw))
+  return { deviceId: url.hostname, sessionId, workspace, title: '设备资源', ...(excerpt ? { excerpt } : {}) }
+}
+function parseExcerpt(value: unknown): Resource['excerpt'] {
+  if (value === undefined) return undefined
+  const excerpt = value as Resource['excerpt']
+  if (!excerpt || typeof excerpt.text !== 'string' || excerpt.text.length > 4000 || typeof excerpt.cachedAt !== 'string'
+    || excerpt.seq !== undefined && (!Number.isSafeInteger(excerpt.seq) || excerpt.seq < 0)
+    || excerpt.path !== undefined && typeof excerpt.path !== 'string'
+    || excerpt.revision !== undefined && typeof excerpt.revision !== 'string') throw new Error('选中文字无效')
+  return excerpt
 }
 export function resourceAddress(resource: Resource): string {
   return `dsh-resource://device-link/view?ref=${encodeURIComponent(reference(resource).ref)}&title=${encodeURIComponent(resource.title)}${resource.referenceId ? `&referenceId=${encodeURIComponent(resource.referenceId)}` : ''}${resource.receiptId ? `&receiptId=${encodeURIComponent(resource.receiptId)}` : ''}${resource.sourceSessionId ? `&sourceSessionId=${encodeURIComponent(resource.sourceSessionId)}` : ''}`
@@ -71,7 +82,7 @@ export async function serializeReference(ref: string, signal: AbortSignal): Prom
   return `引用 ${label}\n<device-link-reference>\n${JSON.stringify(data).replaceAll('<', '\\u003c')}\n</device-link-reference>`
 }
 
-export interface SentReferenceData { ref: string; label: string; source: string; snapshot?: SessionSnapshot; deviceId?: string; workspacePath?: string; referenceId?: string; descriptor?: ReferenceDescriptor; excerpt?: Resource['excerpt'] }
+export interface SentReferenceData { ref: string; label: string; source: string; referenceId: string; descriptor: ReferenceDescriptor; excerpt?: Resource['excerpt'] }
 export const sentReferenceRule = {
   id: 'device-link-reference', order: 10,
   match(text: string, from: number) {
@@ -80,15 +91,16 @@ export const sentReferenceRule = {
     for (const match of text.matchAll(pattern)) {
       try {
         const data = JSON.parse(match[1]) as SentReferenceData
-        parseReference(data.ref)
-        if (typeof data.label !== 'string') continue
-        if (data.snapshot) {
-          const snapshot = data.snapshot
-          const session = snapshot.session
-          if (typeof snapshot.device !== 'string' || typeof snapshot.cachedAt !== 'string' || !session
-            || typeof session.id !== 'string' || typeof session.cwd !== 'string' || typeof session.title !== 'string'
-            || !Array.isArray(session.messages) || !session.messages.every(item => item && ['user', 'assistant'].includes(item.role) && typeof item.text === 'string')) continue
-        }
+        const resource = parseReference(data.ref)
+        const descriptor = data.descriptor
+        if (typeof data.label !== 'string' || typeof data.source !== 'string' || typeof data.referenceId !== 'string' || !data.referenceId
+          || !descriptor || descriptor.id !== data.referenceId || descriptor.deviceId !== resource.deviceId
+          || typeof descriptor.device !== 'string' || typeof descriptor.title !== 'string' || typeof descriptor.workspacePath !== 'string'
+          || typeof descriptor.createdAt !== 'string' || !['online', 'cached', 'unavailable'].includes(descriptor.availability)
+          || !Array.isArray(descriptor.capabilities) || !descriptor.capabilities.every(value => typeof value === 'string')
+          || (resource.sessionId ? descriptor.kind !== 'session' || descriptor.sessionId !== resource.sessionId
+            : descriptor.kind !== 'workspace' || descriptor.workspacePath !== resource.workspace)) continue
+        parseExcerpt(data.excerpt)
         return { id: 'device-link-reference', start: match.index, end: match.index + match[0].length, data }
       } catch { /* Leave malformed reference text visible in the conversation. */ }
     }
@@ -197,7 +209,7 @@ export function createClientState(ctx: ClientContext) {
   }
   function preview(resource: Resource) {
     change({ panel: null })
-    if (!resource.snapshot && ctx.sidebarRight.mounted.getSnapshot()) {
+    if (ctx.sidebarRight.mounted.getSnapshot()) {
       ctx.layout.selectPanel(null)
       const sessionId = ctx.sidebarRight.mounted.getSnapshot()
       const tabs = ctx.sidebarRight.openTabs.getSnapshot().filter(tab => tab.sessionId === sessionId && tab.kind === 'device-link-preview')

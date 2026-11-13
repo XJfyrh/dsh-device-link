@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import vm from 'node:vm'
 import { buildSync } from 'esbuild'
-import { sentReferenceRule, createClientState, draftKey, serializeReference, parseAddress, resourceAddress } from '../src/client/state.ts'
+import { sentReferenceRule, createClientState, draftKey, serializeReference, parseAddress, parseReference, resourceAddress } from '../src/client/state.ts'
 import type { ClientContext } from '../src/client/contracts.ts'
 import type { OutgoingTask } from '../src/lib/types.ts'
 
@@ -55,7 +55,7 @@ test('sending a reference includes a locator without loading session contents; e
     const wire = await serializeReference('device://peer/session?id=s1', new AbortController().signal)
     assert.deepEqual(calls, ['/device-link/api/reference-prepare'])
     const data = sentReferenceRule.match(wire, 0)!.data
-    assert.equal(data.referenceId, 'ref1'); assert.equal(data.snapshot, undefined)
+    assert.equal(data.referenceId, 'ref1'); assert.equal('snapshot' in data, false)
     const excerpt = { text: '决定不用 Redis', seq: 7, cachedAt: '2026-11-12T00:00:00Z' }
     const selected = await serializeReference(`device://peer/session?id=s1&excerpt=${encodeURIComponent(JSON.stringify(excerpt))}`, new AbortController().signal)
     assert.deepEqual(sentReferenceRule.match(selected, 0)!.data.excerpt, excerpt)
@@ -98,12 +98,12 @@ test('@ input source offers cached workspace/session references without probing 
   assert.equal(trigger.onPick({ candidate: candidates[1] }).insert.appearance, 'session')
 })
 
-test('sent reference presentation preserves a complete snapshot and malformed text remains visible', () => {
-  const data = { ref: 'device://remote/session?id=s1', label: 'Lab PC › Cached work', source: 'historical context', snapshot: {
-    device: 'Lab PC', deviceId: 'remote', cachedAt: '2026-11-10T00:00:00Z', session: { id: 's1', title: 'Cached work', cwd: '/workspace', updatedAt: 1, live: false, truncated: false,
-      messages: [{ role: 'user', text: '</device-link-reference> original content' }, { role: 'assistant', text: 'answer' }],
-    },
-  } }
+test('sent reference presentation preserves its locator and explicit excerpt; malformed text remains visible', () => {
+  const data = { ref: 'device://remote/session?id=s1', label: 'Cached work（Lab PC）', source: '选中原文', referenceId: 'ref1',
+    descriptor: { id: 'ref1', deviceId: 'remote', device: 'Lab PC', kind: 'session', sessionId: 's1', title: 'Cached work', workspacePath: '/workspace',
+      createdAt: '2026-11-10T00:00:00Z', availability: 'cached', capabilities: ['搜索对话文本'] },
+    excerpt: { text: '</device-link-reference> original content', seq: 7, cachedAt: '2026-11-10T00:00:00Z' },
+  }
   const wire = `<device-link-reference>\n${JSON.stringify(data).replaceAll('<', '\\u003c')}\n</device-link-reference>`
   const text = `before ${wire} after`
   const node = sentReferenceRule.match(text, 0)!
@@ -113,8 +113,21 @@ test('sent reference presentation preserves a complete snapshot and malformed te
   assert.equal(sentReferenceRule.match(`引用 ${data.label}\n${wire}`, 0)?.start, 0)
   assert.equal(sentReferenceRule.match(text, node.end), undefined)
   assert.equal(sentReferenceRule.match('<device-link-reference>\ninvalid\n</device-link-reference>', 0), undefined)
-  const malformed = JSON.stringify({ ...data, snapshot: { ...data.snapshot, session: { ...data.snapshot.session, messages: [null] } } })
-  assert.equal(sentReferenceRule.match(`<device-link-reference>\n${malformed}\n</device-link-reference>`, 0), undefined)
+  for (const malformed of [
+    { ...data, referenceId: undefined },
+    { ...data, descriptor: { ...data.descriptor, id: 'another-reference' } },
+    { ...data, descriptor: { ...data.descriptor, sessionId: 'another-session' } },
+    { ...data, descriptor: { ...data.descriptor, device: {} } },
+    { ...data, excerpt: { ...data.excerpt, text: {} } },
+    { ...data, excerpt: { ...data.excerpt, seq: '7' } },
+  ]) assert.equal(sentReferenceRule.match(`<device-link-reference>\n${JSON.stringify(malformed)}\n</device-link-reference>`, 0), undefined)
+})
+
+test('device locators require a target and validate excerpt metadata before serialization', () => {
+  for (const ref of ['device://remote/session', 'device://remote/workspace?path=', 'device:///session?id=s1', 'device://remote/workspace?path=/work&id=s1', 'device://remote/session?id=s1&path=/work']) assert.throws(() => parseReference(ref), /设备引用无效/)
+  for (const excerpt of [null, { text: 'text', cachedAt: 'now', seq: -1 }, { text: 'text', cachedAt: 'now', path: {} }, { text: 'text', cachedAt: 'now', revision: 1 }]) {
+    assert.throws(() => parseReference(`device://remote/session?id=s1&excerpt=${encodeURIComponent(JSON.stringify(excerpt))}`), /选中文字无效/)
+  }
 })
 
 test('browser submission persists its identity before a lost response and restores target drafts', async () => {

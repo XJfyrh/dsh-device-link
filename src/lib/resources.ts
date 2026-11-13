@@ -3,7 +3,7 @@ import path from 'node:path'
 import { constants } from 'node:fs'
 import type { HostContext } from './host.js'
 import { authorizedWorkspace, isPathAllowed, sessionAllowed } from './scope.js'
-import { evidenceEvent, revisionOf } from './evidence.js'
+import { evidenceEvent, hasCurrentEvidence, revisionOf } from './evidence.js'
 import { HttpError, type EvidenceEvent, type Scope, type CachedSession } from './types.js'
 
 export interface ResourceTarget { kind: 'workspace' | 'session'; workspacePath: string; sessionId?: string }
@@ -26,7 +26,10 @@ export interface ResourceResult {
   items: ResourceItem[]; coverage: string; truncated: boolean
 }
 const ignored = new Set(['.git', 'node_modules', '.env', '.dsh', '.ssh', '.aws', 'dist', '.next'])
-const excluded = (name: string) => ignored.has(name) || name.startsWith('.env.') && name !== '.env.example'
+const excluded = (name: string) => {
+  const normalized = name.toLowerCase()
+  return ignored.has(normalized) || normalized.startsWith('.env.') && normalized !== '.env.example'
+}
 const integer = (value: unknown, fallback: number, minimum = 0) => {
   if (value === undefined) return fallback
   if (!Number.isSafeInteger(value) || Number(value) < minimum) throw new HttpError(400, 'invalid read position')
@@ -57,20 +60,21 @@ export function queryEvidence(events: EvidenceEvent[], input: ResourceRequest, s
     if (target.revision !== input.revision) throw new HttpError(409, '事件内容已变化，请重新搜索')
     const offset = integer(input.offset, 0)
     if (offset > target.text.length) throw new HttpError(400, 'offset exceeds available content')
-    return { action: input.action, source, observedAt, items: [eventItem(target, true, offset)], truncated: target.truncated,
+    const item = eventItem(target, true, offset)
+    return { action: input.action, source, observedAt, items: [item], truncated: item.truncated === true,
       coverage: `${source === 'cache' ? '已缓存' : '已授权'}事件原文；工具结果描述当时执行情况，不代表当前文件版本` }
   }
   const selected = input.action === 'search' ? events.filter(event => matches(event.text, input.query!)) : events.slice(-20)
   return { action: input.action, source, observedAt, items: selected.slice(0, 20).map(event => {
     const offset = input.action === 'search' ? Math.max(0, event.text.toLocaleLowerCase().indexOf(input.query!.trim().toLocaleLowerCase()) - 80) : 0
     return eventItem(event, false, offset)
-  }), truncated: incomplete || selected.length > 20,
+  }), truncated: incomplete || (input.action === 'inspect' ? events.length : selected.length) > 20,
   coverage: `${source === 'cache' ? '仅本机已缓存' : '已授权'}的对话文本${events.some(event => event.type.startsWith('tool/')) ? '与工具记录' : ''}；${incomplete ? '内容不完整，未命中不代表全部历史中不存在' : '最多返回 20 条，更多结果请缩小查询'}` }
 }
 export function queryCachedSession(session: CachedSession, input: ResourceRequest, tools: boolean): ResourceResult {
-  const events = (session.evidence ?? session.messages.map((message, i) => ({ seq: message.seq ?? i, type: `${message.role}/message`, text: message.text, revision: revisionOf(message.text), time: message.timestamp, truncated: session.truncated })))
-    .filter(event => tools || !event.type.startsWith('tool/'))
-  return queryEvidence(events, input, 'cache', session.cachedAt, session.evidenceTruncated ?? session.truncated)
+  if (!hasCurrentEvidence(session)) throw new HttpError(409, '缓存缺少事件证据，请连接设备重新同步')
+  const events = session.evidence.filter(event => tools || !event.type.startsWith('tool/'))
+  return queryEvidence(events, input, 'cache', session.cachedAt, session.evidenceTruncated)
 }
 
 /** Reads beneath the authorized real root; directory links and sensitive config names are not traversed. */
@@ -90,13 +94,21 @@ async function readFile(root: string, relative: string) {
     const stat = await file.stat()
     if (!stat.isFile() || stat.size > 512_000) throw new HttpError(413, '仅支持读取 512 KB 以内的文本文件')
     const bytes = Buffer.alloc(Math.min(stat.size + 1, 512_001))
-    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0)
+    let bytesRead = 0
+    while (bytesRead < bytes.length) {
+      const chunk = await file.read(bytes, bytesRead, bytes.length - bytesRead, bytesRead)
+      if (!chunk.bytesRead) break
+      bytesRead += chunk.bytesRead
+    }
     if (bytesRead > 512_000) throw new HttpError(413, '文件过大')
     const content = bytes.subarray(0, bytesRead)
     if (content.includes(0)) throw new HttpError(415, '不读取二进制文件')
     const after = await file.stat()
     if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || await fs.realpath(filename) !== real) throw new HttpError(409, '文件读取期间发生变化')
-    return { text: new TextDecoder('utf-8', { fatal: true }).decode(content), revision: revisionOf(content) }
+    let text: string
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(content) }
+    catch { throw new HttpError(415, '仅支持 UTF-8 文本文件') }
+    return { text, revision: revisionOf(content) }
   } finally { await file.close() }
 }
 async function workspaceQuery(input: ResourceRequest, scope: Scope): Promise<ResourceResult> {
@@ -114,10 +126,12 @@ async function workspaceQuery(input: ResourceRequest, scope: Scope): Promise<Res
     let end = start; let text = ''
     while (end <= lines.length && end < start + 120) {
       const line = lines[end - 1]
-      if (text.length + line.length > 16_000) { if (!text) throw new HttpError(413, '单行内容过长，无法按行读取'); break }
-      text += (text ? '\n' : '') + line; end++
+      const addition = (end > start ? '\n' : '') + line
+      if (text.length + addition.length > 16_000) { if (end === start) throw new HttpError(413, '单行内容过长，无法按行读取'); break }
+      text += addition; end++
     }
     result.items = [{ title: relative, path: relative, revision: file.revision, text, startLine: start, endLine: end - 1, ...(end <= lines.length ? { nextLine: end } : {}) }]
+    result.truncated = end <= lines.length
     return result
   }
   const directory = input.path ?? ''
@@ -161,20 +175,12 @@ export function createResourceProvider(ctx: Pick<HostContext, 'get'>) {
     if (input.kind === 'workspace') return workspaceQuery(input, scope)
     if (scope.sessionSync !== 'content' || !sessionAllowed({ id: input.sessionId!, cwd: input.workspacePath }, scope)) throw new HttpError(403, '会话正文未授权', 'scope')
     const query = ctx.get('sessionQuery')
-    if (!query?.filterEvents || !query.readEvent) throw new HttpError(503, '当前 DSH 未提供会话查询服务')
-    const snapshot = await query.readSession(input.sessionId!)
+    if (!query) throw new HttpError(503, '当前 DSH 未提供会话查询服务')
+    const snapshot = input.action === 'read'
+      ? await query.readEvent({ sessionId: input.sessionId!, seq: integer(input.seq, -1) }).then(read => ({ session: read.session, events: [read.target] }))
+      : await query.readSession(input.sessionId!)
     if (snapshot.session.cwd !== input.workspacePath) throw new HttpError(403, '会话工作区已变化', 'scope')
-    let events = snapshot.events
-    if (input.action === 'search') {
-      const hits = await query.filterEvents(input.sessionId!, [{ kind: 'text', text: input.query! }])
-      const seqs = new Set(hits.map(hit => hit.seq))
-      events = events.filter(event => seqs.has(event.seq))
-    } else if (input.action === 'read') {
-      const read = await query.readEvent({ sessionId: input.sessionId!, seq: integer(input.seq, -1) })
-      if (read.session.cwd !== input.workspacePath) throw new HttpError(403, '会话工作区已变化', 'scope')
-      events = [read.target]
-    }
-    const evidence = events.map(event => evidenceEvent(event, scope.sessionTools === true, Infinity)).filter((event): event is EvidenceEvent => Boolean(event))
+    const evidence = snapshot.events.map(event => evidenceEvent(event, scope.sessionTools === true, Infinity)).filter((event): event is EvidenceEvent => Boolean(event))
     return queryEvidence(evidence, input, 'device', new Date().toISOString(), evidence.some(event => event.truncated))
   }
 }

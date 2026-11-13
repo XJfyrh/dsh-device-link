@@ -10,7 +10,8 @@
 |---|---|---|
 | 配对、授权、网络边界 | `pairing`、`scope`、`serve`、`network` | `serve`、`collaboration` |
 | GUI HTTP 与 WebSocket | `credentials`、`proxy` | `proxy`、`integration` |
-| 状态与缓存 | `store`、`connect`、`host-facts` | `collaboration`、`host-facts` |
+| 身份、状态与缓存 | `identity`、`store`、`connect`、`host-facts` | `identity`、`collaboration`、`host-facts` |
+| 资料引用与读取 | `references`、`resources`、`evidence` | `resources`、`client`、双实例脚本 |
 | 任务与模型 | `tasks`、`outgoing-tasks`、`delegation`、`models` | `tasks`、`host-facts`、`models` |
 | 所有者入口 | `api`、`commands`、`tool` | `commands`、`tool`、双实例脚本 |
 
@@ -19,7 +20,7 @@
 ## 维护约束
 
 - 当前阶段不维护旧协议、旧状态迁移或旧宿主 API。删除前核对生产写入者、调用路径及测试所保护的行为；无引用搜索只是线索。
-- 授权在接收方执行，覆盖 HTTP、WebSocket、状态、正文和任务。异步读取返回前再次检查期间的授权变更。
+- 授权在接收方执行，覆盖 HTTP、WebSocket、状态、正文、资料读取和任务。异步读取返回或提交缓存前再次检查期间的授权变更。
 - 委派验证工作区真实路径与执行设备沙箱。不能用界面筛选代替服务端授权。
 - 任务先持久化再执行，重试保留请求 id；结果、模型与正文按请求和轮次关联，不能按相同文本去重。
 - 状态更新串行提交，写盘成功才发布内存快照。读取或备份失败不能覆盖已有文件。
@@ -49,7 +50,7 @@ npm run test:e2e:protocol
 
 此模式从临时 home 启动，指定空的测试凭据名和回环模型地址，验证缺少凭据时的持久化错误结果及协议流程。它不加载项目 `.env`，也不复制模型配置。默认 Harness 入口为 `%LOCALAPPDATA%/npm/node_modules/@deepseek-ai/dsh/lib/bin.js`，其他安装位置设置 `DSH_CLI`。
 
-真实模型验证：将 `.env.example` 复制为 `.env`，填写 `DEEPSEEK_API_KEY` 后执行 `npm run test:e2e`。脚本检查回复标识、受限工作区读写、越界拒绝、正文同步、任务重试、续写和停止。也可设置 `E2E_MODEL_HOME`，从指定隔离模板复制 `.credentials.yaml` 和 `settings.json`。
+真实模型验证：将 `.env.example` 复制为 `.env`，填写 `DEEPSEEK_API_KEY` 后执行 `npm run test:e2e`。脚本检查回复标识、受限工作区读写、越界拒绝、正文与工具结果读取、任务重试、续写和停止。也可设置 `E2E_MODEL_HOME`，从指定隔离模板复制 `.credentials.yaml` 和 `settings.json`。
 
 浏览器检查：
 
@@ -59,7 +60,7 @@ $env:E2E_BROWSER = '1'
 npm run test:e2e
 ```
 
-已有 Chromium 可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。浏览器覆盖设备面板、配对、收藏、引用、任务卡片、草稿恢复和窄屏；配置模型时继续验证模型切换、真实委派与离线引用。
+已有 Chromium 可设置 `PLAYWRIGHT_EXECUTABLE_PATH`。浏览器覆盖设备面板、配对、收藏、引用、任务卡片、草稿恢复和窄屏；配置模型时继续验证模型切换、真实委派、按需文件和事件读取、离线引用。
 
 结果写入 `.e2e/acceptance.json`，截图和可访问性快照也在 `.e2e/`。交付说明写本次运行范围、结果和未验证项，不把历史通过次数写成当前保证。
 

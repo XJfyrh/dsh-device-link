@@ -4,6 +4,7 @@ import { readableTitle } from './presentation.js'
 import { normalizeDeviceName } from './identity.js'
 import path from 'node:path'
 import { queryCachedSession, type ResourceRequest, type ResourceResult } from './resources.js'
+import { hasCurrentEvidence } from './evidence.js'
 
 export function sessionInScope(session: { id: string; cwd: string }, status: RemoteStatus): boolean {
   const scope = status.scope
@@ -68,6 +69,7 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     if (status.api !== API_VERSION || status.device?.deviceId !== peer.deviceId || !scope
       || !(scope.workspaces === 'all' || strings(scope.workspaces)) || !(scope.sessionIds === 'all' || strings(scope.sessionIds))
       || typeof scope.allowUi !== 'boolean' || typeof scope.allowDelegate !== 'boolean' || !['none', 'metadata', 'content'].includes(scope.sessionSync)
+      || typeof scope.allowReadFiles !== 'boolean' || typeof scope.sessionTools !== 'boolean'
       || !Array.isArray(status.host?.workspaces) || !status.host.workspaces.every(item => typeof item?.id === 'string' && typeof item.path === 'string')
       || !Array.isArray(status.host.sessions) || !status.host.sessions.every(item => typeof item?.id === 'string' && typeof item.cwd === 'string')
       || !Array.isArray(status.host.agents)) throw new HttpError(502, 'device identity or protocol mismatch')
@@ -78,9 +80,13 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     const { session } = await request<{ session: SessionContent }>(peer.baseUrl, `/dl/session?id=${encodeURIComponent(id)}`, { token: peer.token })
     if (!session || session.id !== id || typeof session.cwd !== 'string' || !Array.isArray(session.messages)
       || !session.messages.every(message => ['user', 'assistant'].includes(message?.role) && typeof message.text === 'string')
+      || !hasCurrentEvidence(session)
       || (expectedCwd !== undefined && session.cwd !== expectedCwd)) throw new HttpError(502, 'invalid session content')
     if (!sessionInScope(session, status)) throw new HttpError(403, 'session is outside the grant')
-    return session
+    return authorizedContent(session, status)
+  }
+  function authorizedContent<T extends SessionContent>(session: T, status: RemoteStatus): T {
+    return { ...session, evidence: session.evidence.filter(event => status.scope.sessionTools || !event.type.startsWith('tool/')) }
   }
   async function refresh(peer: Peer): Promise<PeerView> {
     try {
@@ -91,10 +97,10 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
         const listed = new Map(status.host.sessions.map(session => [session.id, session]))
         for (const session of Object.values(previous)) {
           const fact = listed.get(session.id)
-          if (sessionInScope(session, status) && (!fact || fact.cwd === session.cwd)) sessions[session.id] = { ...session, evidence: session.evidence?.filter(event => status.scope.sessionTools || !event.type.startsWith('tool/')) }
+          if (hasCurrentEvidence(session) && sessionInScope(session, status) && (!fact || fact.cwd === session.cwd)) sessions[session.id] = authorizedContent(session, status)
         }
         // The directory is capped; omitted cached sessions need an authorized read, not eviction.
-        const toRead = [...status.host.sessions.slice(0, 20), ...Object.values(sessions).filter(session => !listed.has(session.id))]
+        const toRead = [...status.host.sessions.slice(0, 20), ...Object.values(previous).filter(session => !listed.has(session.id) && sessionInScope(session, status))]
         for (const session of toRead) {
           try {
             const content = await readSession(peer, session.id, status, listed.get(session.id)?.cwd)
@@ -153,7 +159,8 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
     const cache = store.state().peers[peer.deviceId]?.cache
     const session = cache && Object.hasOwn(cache.sessions, id) ? cache.sessions[id] : undefined
     if (!cache || !session || !sessionInScope(session, cache.status)) throw new HttpError(404, '该会话尚未缓存或授权已移除')
-    return { session: { ...session, title: readableTitle(session, session.messages) }, cachedAt: session.cachedAt, deviceId: peer.deviceId, device: peer.name }
+    if (!hasCurrentEvidence(session)) throw new HttpError(409, '会话缓存缺少有效事件证据，请重新同步此会话')
+    return { session: { ...authorizedContent(session, cache.status), title: readableTitle(session, session.messages) }, cachedAt: session.cachedAt, deviceId: peer.deviceId, device: peer.name }
   }
   async function fetchSession(peer: Peer, id: string) {
     const view = await sync(peer, true)
@@ -182,7 +189,7 @@ export function createConnector({ store, fetchImpl = globalThis.fetch, log = con
       const currentFact = current?.cache?.status.host.sessions.find(item => item.id === id)
       if (current?.token !== peer.token || !current.cache || !sessionInScope(session, current.cache.status)
         || (currentFact && currentFact.cwd !== session.cwd)) throw new HttpError(403, '会话授权已变更')
-      current.cache.sessions[id] = { ...session, cachedAt: new Date().toISOString() }
+      current.cache.sessions[id] = { ...authorizedContent(session, current.cache.status), cachedAt: new Date().toISOString() }
     })
     views.delete(peer.deviceId)
     return cachedSession(peer, id)

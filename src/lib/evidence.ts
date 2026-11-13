@@ -1,8 +1,18 @@
 import { createHash } from 'node:crypto'
 import type { HostEvent } from './host.js'
-import { record, type EvidenceEvent } from './types.js'
+import { record, type EvidenceEvent, type SessionContent } from './types.js'
 
 export const revisionOf = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex')
+export function hasCurrentEvidence(value: unknown): value is Pick<SessionContent, 'evidence' | 'evidenceTruncated'> {
+  const session = record(value)
+  return typeof session.evidenceTruncated === 'boolean' && Array.isArray(session.evidence) && session.evidence.every(value => {
+    const event = record(value)
+    return Number.isSafeInteger(event.seq) && Number(event.seq) >= 0
+      && typeof event.type === 'string' && ['user/message', 'assistant/message', 'tool/call', 'tool/result'].includes(event.type)
+      && typeof event.text === 'string' && typeof event.revision === 'string' && /^[a-f0-9]{64}$/.test(event.revision)
+      && typeof event.truncated === 'boolean' && (event.time === undefined || typeof event.time === 'number' && Number.isFinite(event.time))
+  })
+}
 function textOf(value: unknown): string {
   if (typeof value === 'string') return value
   if (!Array.isArray(value)) return ''
@@ -14,7 +24,7 @@ export function evidenceEvent(event: HostEvent, tools: boolean, maxChars = 64_00
   if (event.type === 'user/message' && record(event.data.source).kind === 'user') text = textOf(event.data.content)
   if (event.type === 'assistant/message') text = textOf(record(event.data.message).content)
   if (tools && event.type === 'tool/result') text = textOf(record(event.data.message).content)
-  if (tools && event.type === 'tool/call') text = JSON.stringify(event.data.call ?? event.data)
+  if (tools && event.type === 'tool/call') text = JSON.stringify(event.data)
   if (!text.trim()) return
   return { seq: event.seq, type: event.type, time: event.time, revision: revisionOf(text), text: text.slice(0, maxChars), truncated: text.length > maxChars }
 }

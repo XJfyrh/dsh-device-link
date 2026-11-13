@@ -7,6 +7,8 @@ import type { Runtime } from '../src/index.ts'
 function fixture() {
   let command: Parameters<HostContext['commands']['register']>[0] | undefined
   const revoked: string[] = []
+  const disconnected: string[] = []
+  const removedReferences: string[] = []
   const submitted: { workspacePath: string; task: string }[] = []
   const runtime = {
     store: { state: () => ({ identity: { deviceId: 'local' } }) },
@@ -18,14 +20,16 @@ function fixture() {
     connector: {
       peerByRef: (reference: string) => ['peer', 'peer with spaces'].includes(reference) ? { deviceId: 'peer' } : undefined,
       cachedSession: (_peer: unknown, id: string) => ({ id }),
+      revoke: async (peer: { deviceId: string }) => { disconnected.push(peer.deviceId); return { revoked: true } },
     },
+    references: { removePeer: async (id: string) => { removedReferences.push(id) } },
     outgoingTasks: { start: async (_peer: unknown, input: { workspacePath: string; task: string }) => { submitted.push(input); return { id: 'task' } } },
   }
   const ctx = { commands: { register(value: NonNullable<typeof command>) { command = value; return () => {} } } }
   registerDeviceCommands(ctx as HostContext, { load: async () => runtime as unknown as Runtime })
   assert.ok(command)
   const registered = command
-  return { run: (rawInput: string) => registered.handler({ rawInput }), revoked, submitted }
+  return { run: (rawInput: string) => registered.handler({ rawInput }), revoked, disconnected, removedReferences, submitted }
 }
 
 test('device command accepts empty status and trims delegate input consistently', async () => {
@@ -49,4 +53,11 @@ test('untrust rejects ambiguous names and revokes only the explicitly selected d
   assert.deepEqual(revoked, [])
   assert.equal((await run('untrust b')).kind, 'success')
   assert.deepEqual(revoked, ['b'])
+})
+
+test('revoke removes the disconnected device references and read receipts', async () => {
+  const { run, disconnected, removedReferences } = fixture()
+  assert.equal((await run('revoke peer with spaces')).kind, 'success')
+  assert.deepEqual(disconnected, ['peer'])
+  assert.deepEqual(removedReferences, ['peer'])
 })

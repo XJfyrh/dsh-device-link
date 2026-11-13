@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { registerDeviceTools } from '../src/lib/tool.ts'
 import type { HostContext, HostServices, ToolDefinition } from '../src/lib/host.ts'
 
-test('device tools return lossless JSON when optional result and cache fields are absent', async () => {
+test('task tools return lossless JSON before a remote result is available', async () => {
   const registered = new Map<string, ToolDefinition>()
   const task = { id: 'task', deviceName: 'remote', workspacePath: '/workspace', submission: 'pending' }
   const runtime = {
