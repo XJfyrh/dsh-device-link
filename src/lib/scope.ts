@@ -55,7 +55,8 @@ export function isResolvedPathAllowed(value: string, allowed: WorkspaceScope = '
   if (isPathAllowed(value, allowed)) return true
   if (allowed === 'all') return false
   return allowed.some(base => {
-    try { return isPathAllowed(value, [realpathSync(base)]) } catch { return false }
+    // Match fs.promises.realpath: the legacy sync resolver preserves Windows 8.3 names.
+    try { return isPathAllowed(value, [realpathSync.native(base)]) } catch { return false }
   })
 }
 
