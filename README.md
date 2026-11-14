@@ -87,7 +87,9 @@ dsh plugin --profile desktop add dsh-device-link
 
 ### 从安装包安装
 
-在桌面版插件页安装 `.tgz` 文件并重启对应 profile，也可通过 CLI 安装。将下例路径替换为安装包的绝对路径：
+从 GitHub Releases 的 Assets 中下载 `.tgz` 安装包，在桌面版插件页安装后重启对应 profile。[下载安装包](https://github.com/XJfyrh/dsh-device-link/releases/latest)
+
+也可通过 CLI 安装。将下例路径替换为安装包的绝对路径：
 
 ```powershell
 dsh plugin --profile desktop add "C:/Downloads/dsh-device-link-0.5.2.tgz"
